@@ -395,7 +395,8 @@ def main():
 
         cfg=cfg, dist_train=dist_train, logger_iter_interval=args.logger_iter_interval,
 
-        ckpt_save_time_interval=args.ckpt_save_time_interval
+        ckpt_save_time_interval=args.ckpt_save_time_interval,
+        grad_accum_nums=4
 
     )
 

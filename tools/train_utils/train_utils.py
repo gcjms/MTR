@@ -10,10 +10,10 @@ import torch
 import tqdm
 from torch.nn.utils import clip_grad_norm_
 
-
 def train_one_epoch(model, optimizer, train_loader, accumulated_iter, optim_cfg,
                     rank, tbar, total_it_each_epoch, dataloader_iter, tb_log=None, leave_pbar=False, scheduler=None, show_grad_curve=False,
-                    logger=None, logger_iter_interval=50, cur_epoch=None, total_epochs=None, ckpt_save_dir=None, ckpt_save_time_interval=300):
+                    logger=None, logger_iter_interval=50, cur_epoch=None, total_epochs=None, ckpt_save_dir=None, ckpt_save_time_interval=300,
+                    grad_accum_nums=1):
     if total_it_each_epoch == len(train_loader):
         dataloader_iter = iter(train_loader)
 
@@ -24,6 +24,11 @@ def train_one_epoch(model, optimizer, train_loader, accumulated_iter, optim_cfg,
 
     ckpt_save_cnt = 1
     start_it = accumulated_iter % total_it_each_epoch
+    
+    # 1. 循环开始前清空一次梯度
+    optimizer.zero_grad()
+    if optimizer_2 is not None:
+        optimizer_2.zero_grad()
 
     for cur_it in range(start_it, total_it_each_epoch):
         try:
@@ -33,35 +38,49 @@ def train_one_epoch(model, optimizer, train_loader, accumulated_iter, optim_cfg,
             batch = next(dataloader_iter)
             print('new iters')
 
-        if scheduler is not None:
-            try:
-                scheduler.step(accumulated_iter)
-            except:
-                scheduler.step()
-
         try:
             cur_lr = float(optimizer.lr)
         except:
             cur_lr = optimizer.param_groups[0]['lr']
 
         model.train()
-        optimizer.zero_grad()
-        if optimizer_2 is not None:
-            optimizer_2.zero_grad()
+        
+        # 2. 删除此处的 optimizer.zero_grad()，否则无法累积梯度
+        # optimizer.zero_grad() 
 
         loss, tb_dict, disp_dict = model(batch)
-
+        
+        # 3. Loss 缩放
+        loss = loss / grad_accum_nums
         loss.backward()
 
-        total_norm = clip_grad_norm_(model.parameters(), optim_cfg.GRAD_NORM_CLIP)
+        total_norm = 0
+        
+        # 4. 判断是否达到累积次数
+        if (accumulated_iter + 1) % grad_accum_nums == 0:
+            total_norm = clip_grad_norm_(model.parameters(), optim_cfg.GRAD_NORM_CLIP)
+            
+            # 5. 只有在这里才更新参数
+            optimizer.step()
+            optimizer.zero_grad() # 更新完必须清空，为下一轮累积做准备
+            
+            if optimizer_2 is not None:
+                optimizer_2.step()
+                optimizer_2.zero_grad()
+                
+            # 6. Scheduler 通常跟随着 optimizer.step() 更新
+            if scheduler is not None:
+                try:
+                    scheduler.step(accumulated_iter)
+                except:
+                    scheduler.step()
 
-        optimizer.step()
-
-        if optimizer_2 is not None:
-            optimizer_2.step()
-
+        # 7. 计数器只加一次，且放在逻辑最后
         accumulated_iter += 1
-        disp_dict.update({'loss': loss.item(), 'lr': cur_lr})
+        
+        # --- 原始代码中错误的 step 和重复的计数已被删除 ---
+
+        disp_dict.update({'loss': loss.item() * grad_accum_nums, 'lr': cur_lr}) # 显示 loss 时乘回去，方便查看原始数值
 
         # log to console and tensorboard
         if rank == 0:
@@ -89,7 +108,12 @@ def train_one_epoch(model, optimizer, train_loader, accumulated_iter, optim_cfg,
                 if show_grad_curve:
                     for key, val in model.named_parameters():
                         key = key.replace('.', '/')
-                        tb_log.add_scalar('train_grad/' + key, val.grad.abs().max().item(), accumulated_iter)
+                        try:
+                             # 只有在梯度存在时才记录，避免累积过程中某些参数无梯度报错
+                            if val.grad is not None:
+                                tb_log.add_scalar('train_grad/' + key, val.grad.abs().max().item(), accumulated_iter)
+                        except:
+                            pass
 
             time_past_this_epoch = pbar.format_dict['elapsed']
             if time_past_this_epoch // ckpt_save_time_interval >= ckpt_save_cnt:
@@ -103,7 +127,6 @@ def train_one_epoch(model, optimizer, train_loader, accumulated_iter, optim_cfg,
     if rank == 0:
         pbar.close()
     return accumulated_iter
-
 
 def learning_rate_decay(i_epoch, optimizer, optim_cfg):
     if isinstance(optimizer, list):
@@ -123,7 +146,7 @@ def train_model(model, optimizer, train_loader, optim_cfg,
                 start_epoch, total_epochs, start_iter, rank, ckpt_save_dir, train_sampler=None,
                 ckpt_save_interval=1, max_ckpt_save_num=50, merge_all_iters_to_one_epoch=False, tb_log=None,
                 scheduler=None, test_loader=None, logger=None, eval_output_dir=None, cfg=None, dist_train=False,
-                logger_iter_interval=50, ckpt_save_time_interval=300):
+                logger_iter_interval=50, ckpt_save_time_interval=300, grad_accum_nums=1):
     accumulated_iter = start_iter
     with tqdm.trange(start_epoch, total_epochs, desc='epochs', dynamic_ncols=True, leave=(rank == 0)) as tbar:
         total_it_each_epoch = len(train_loader)
@@ -151,7 +174,8 @@ def train_model(model, optimizer, train_loader, optim_cfg,
                 dataloader_iter=dataloader_iter,
                 scheduler=scheduler, cur_epoch=cur_epoch, total_epochs=total_epochs,
                 logger=logger, logger_iter_interval=logger_iter_interval,
-                ckpt_save_dir=ckpt_save_dir, ckpt_save_time_interval=ckpt_save_time_interval
+                ckpt_save_dir=ckpt_save_dir, ckpt_save_time_interval=ckpt_save_time_interval,
+                grad_accum_nums=grad_accum_nums
             )
 
             # save trained model

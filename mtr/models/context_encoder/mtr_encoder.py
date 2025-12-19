@@ -190,6 +190,8 @@ class MTREncoder(nn.Module):
         assert map_polylines_feature.shape[1] == num_polylines
 
         # organize return features
+        # 从当前 Batch 的每一个样本中，提取出我们要预测的那辆特定车的特征, 这个track_index_to_predict在数据处理阶段就已经搞好了
+        # center_objects_feature: (num_center_objects, C)
         center_objects_feature = obj_polylines_feature[torch.arange(num_center_objects), track_index_to_predict]
 
         batch_dict['center_objects_feature'] = center_objects_feature

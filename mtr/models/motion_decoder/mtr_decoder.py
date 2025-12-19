@@ -423,121 +423,99 @@ class MTRDecoder(nn.Module):
         return intention_query, intention_points
 
     def apply_cross_attention(self, kv_feature, kv_mask, kv_pos, query_content, query_embed, attention_layer,
+                                dynamic_query_center=None, layer_idx=0, use_local_attn=False, query_index_pair=None,
+                                query_content_pre_mlp=None, query_embed_pre_mlp=None):
+            """
+            Args:
+                kv_feature (B, N, C): 环境特征（Key/Value）。比如周围所有车辆、车道线的特征。
+                kv_mask (B, N): 掩码。标记哪些是真实数据，哪些是Padding的空数据。
+                kv_pos (B, N, 3): 环境物体的位置坐标 (x, y, z)。
+                query_content (M, B, C): Query的内容特征。M=64(模式数)。随着层数变深，这里面存的是"语义信息"（比如：前方有障碍）。
+                query_embed (M, B, C): Query的意图嵌入。代表这64个模式原本的"身份信息"（比如：我是左转模式）。
+                dynamic_query_center (M, B, 2): 动态锚点中心。重要！这是当前层Query在地图上的绝对坐标 (x, y)。
+                attention_layer: Transformer的注意力层对象。
+                query_index_pair (B, M, K): 局部注意力用的索引。如果开启Local模式，每个Query只看最近的K个邻居。
+            """
 
-                              dynamic_query_center=None, layer_idx=0, use_local_attn=False, query_index_pair=None,
+            # 1. 预处理 (Pre-MLP)
+            # 有时候在进入Attention之前，需要先通过一个全连接层(MLP)调整一下特征维度或进行非线性变换
+            if query_content_pre_mlp is not None:
+                query_content = query_content_pre_mlp(query_content)
+            if query_embed_pre_mlp is not None:
+                query_embed = query_embed_pre_mlp(query_embed)
 
-                              query_content_pre_mlp=None, query_embed_pre_mlp=None):
+            # 获取维度信息：num_q=64(模式数), d_model=256(特征维度)
+            num_q, batch_size, d_model = query_content.shape
 
-        """
+            # 2. 生成 Query 的几何位置编码 (Geometric Embedding)
+            # dynamic_query_center 是这 64 个锚点当前在地图上的 (x, y) 坐标
+            # 这里用正弦位置编码 (Sinusoidal PE) 把坐标变成向量，让 Attention 知道"我在哪"
+            # searching_query: (M, B, C)
+            searching_query = position_encoding_utils.gen_sineembed_for_position(dynamic_query_center, hidden_dim=d_model)
 
-        Args:
+            # 3. 生成 Key/Value 的几何位置编码
+            # kv_pos 原本是 (B, N, 3)，这里 permute 成 (N, B, 3)，并只取前两维 (x, y)
+            kv_pos = kv_pos.permute(1, 0, 2)[:, :, 0:2]
+            # 同样把环境物体的位置变成向量，让 Attention 知道"物体在哪"
+            kv_pos_embed = position_encoding_utils.gen_sineembed_for_position(kv_pos, hidden_dim=d_model)
 
-            kv_feature (B, N, C):
+            # -----------------------------------------------------------------
+            # 分支 A: 全局注意力 (Global Attention) - 默认模式
+            # 每一个 Query 都会看环境里的每一个物体 (All-to-All)
+            # -----------------------------------------------------------------
+            if not use_local_attn:
+                query_feature = attention_layer(
+                    tgt=query_content,                # Query的内容 (Q_content)
+                    query_pos=query_embed,            # Query的意图身份 (Q_pos)
+                    query_sine_embed=searching_query, # Query的几何位置 (Q_geometry) -> 用来计算和物体的相对距离
+                    memory=kv_feature.permute(1, 0, 2), # Key/Value的内容 (K, V) -> 环境特征
+                    memory_key_padding_mask=~kv_mask,   # 告诉它别看 Padding 的空数据
+                    pos=kv_pos_embed,                   # Key/Value的位置 (K_pos)
+                    is_first=(layer_idx == 0)           #如果是第一层，会有特殊的初始化处理
+                )  # 输出形状: (M, B, C) -> 更新后的 Query 特征
 
-            kv_mask (B, N):
+            # -----------------------------------------------------------------
+            # 分支 B: 局部注意力 (Local Attention) - 加速/优化模式
+            # 每一个 Query 只看离自己最近的 K 个物体 (Sparse Attention)
+            # -----------------------------------------------------------------
+            else:
+                batch_size, num_kv, _ = kv_feature.shape
+                
+                # 扁平化操作 (Flatten)
+                # 为了高效计算，把 Batch 维度和 N 维度拼起来 -> (B*N, C)
+                kv_feature_stack = kv_feature.flatten(start_dim=0, end_dim=1)
+                kv_pos_embed_stack = kv_pos_embed.permute(1, 0, 2).contiguous().flatten(start_dim=0, end_dim=1)
+                kv_mask_stack = kv_mask.view(-1)
 
-            kv_pos (B, N, 3):
+                # 记录每个样本有多少个物体，方便后续恢复索引
+                key_batch_cnt = num_kv * torch.ones(batch_size).int().to(kv_feature.device)
 
-            query_tgt (M, B, C):
+                # query_index_pair 里面存的是 KNN 搜索得到的索引：即每个 Query 应该关注哪几个物体
+                query_index_pair = query_index_pair.view(batch_size * num_q, -1)
+                
+                # 生成 Batch 索引辅助向量
+                index_pair_batch = torch.arange(batch_size).type_as(key_batch_cnt)[:, None].repeat(1, num_q).view(-1)  
+                assert len(query_index_pair) == len(index_pair_batch)
 
-            query_embed (M, B, C):
+                # 调用支持局部索引的 Attention 层
+                query_feature = attention_layer(
+                    tgt=query_content,
+                    query_pos=query_embed,
+                    query_sine_embed=searching_query,
+                    memory=kv_feature_stack,       # 拍扁后的环境特征
+                    memory_valid_mask=kv_mask_stack,
+                    pos=kv_pos_embed_stack,        # 拍扁后的环境位置
+                    is_first=(layer_idx == 0),
+                    key_batch_cnt=key_batch_cnt,
+                    index_pair=query_index_pair,   # 核心：只对这些索引对进行 Attention 计算！ local_attention的新增指出 只看关键障碍物
+                    index_pair_batch=index_pair_batch
+                )
 
-            dynamic_query_center (M, B, 2): . Defaults to None.
+                # 恢复形状: (B*M, C) -> (B, M, C) -> (M, B, C)
+                query_feature = query_feature.view(batch_size, num_q, d_model).permute(1, 0, 2)
 
-            attention_layer (layer):
-
-            query_index_pair (B, M, K)
-
-        Returns:
-
-            attended_features: (B, M, C)
-
-            attn_weights:
-
-        """
-
-        if query_content_pre_mlp is not None:
-
-            query_content = query_content_pre_mlp(query_content)
-
-        if query_embed_pre_mlp is not None:
-
-            query_embed = query_embed_pre_mlp(query_embed)
-
-        num_q, batch_size, d_model = query_content.shape
-
-        searching_query = position_encoding_utils.gen_sineembed_for_position(dynamic_query_center, hidden_dim=d_model)
-
-        kv_pos = kv_pos.permute(1, 0, 2)[:, :, 0:2]
-
-        kv_pos_embed = position_encoding_utils.gen_sineembed_for_position(kv_pos, hidden_dim=d_model)
-
-        if not use_local_attn:
-
-            query_feature = attention_layer(
-
-                tgt=query_content,
-
-                query_pos=query_embed,
-
-                query_sine_embed=searching_query,
-
-                memory=kv_feature.permute(1, 0, 2),
-
-                memory_key_padding_mask=~kv_mask,
-
-                pos=kv_pos_embed,
-
-                is_first=(layer_idx == 0)
-
-            )  # (M, B, C)
-
-        else:
-
-            batch_size, num_kv, _ = kv_feature.shape
-
-            kv_feature_stack = kv_feature.flatten(start_dim=0, end_dim=1)
-
-            kv_pos_embed_stack = kv_pos_embed.permute(1, 0, 2).contiguous().flatten(start_dim=0, end_dim=1)
-
-            kv_mask_stack = kv_mask.view(-1)
-
-            key_batch_cnt = num_kv * torch.ones(batch_size).int().to(kv_feature.device)
-
-            query_index_pair = query_index_pair.view(batch_size * num_q, -1)
-
-            index_pair_batch = torch.arange(batch_size).type_as(key_batch_cnt)[:, None].repeat(1, num_q).view(-1)  # (batch_size * num_q)
-
-            assert len(query_index_pair) == len(index_pair_batch)
-
-            query_feature = attention_layer(
-
-                tgt=query_content,
-
-                query_pos=query_embed,
-
-                query_sine_embed=searching_query,
-
-                memory=kv_feature_stack,
-
-                memory_valid_mask=kv_mask_stack,
-
-                pos=kv_pos_embed_stack,
-
-                is_first=(layer_idx == 0),
-
-                key_batch_cnt=key_batch_cnt,
-
-                index_pair=query_index_pair,
-
-                index_pair_batch=index_pair_batch
-
-            )
-
-            query_feature = query_feature.view(batch_size, num_q, d_model).permute(1, 0, 2)  # (M, B, C)
-
-        return query_feature
-
+            return query_feature # 返回吸收了环境信息后的 Query 特征
+    
     def apply_dynamic_map_collection(self, map_pos, map_mask, pred_waypoints, base_region_offset, num_query, num_waypoint_polylines=128, num_base_polylines=256, base_map_idxs=None):
 
         map_pos = map_pos.clone()
@@ -593,61 +571,36 @@ class MTRDecoder(nn.Module):
     def apply_transformer_decoder(self, center_objects_feature, center_objects_type, obj_feature, obj_mask, obj_pos, map_feature, map_mask, map_pos):
 
         """
-
         MTR Decoder 的核心前向传播。
-
         执行多层 Transformer Decoder Block，每层都包含：
-
         1. Cross-Attn (Agent-Agent)
-
         2. Dynamic Map Collection (基于当前预测位置动态搜索地图)
-
         3. Cross-Attn (Agent-Map)
-
         4. Feature Fusion & Prediction
-
         5. Trajectory Update (用于下一层的搜索引导)
-
         """
-
-       
-
         # 1. 获取意图锚点 (Intention Query)
-
         # 这里的 intention_points 是通过 K-Means 聚类得到的静态锚点 (比如 64 个终点)
-
         # intention_query: (num_query, Batch, C) - 这里的 num_query 也就是 num_modes (比如 64)， C=256
-
         intention_query, intention_points = self.get_motion_query(center_objects_type)
-
-       
 
         # 初始化 Query 的内容特征，第一层输入通常为 0
 
         query_content = torch.zeros_like(intention_query)
 
-       
-
         # 保存锚点供 Loss 计算使用
-
         self.forward_ret_dict['intention_points'] = intention_points.permute(1, 0, 2)  # (Batch, num_query, 2)
-
         num_center_objects = query_content.shape[1] # Batch Size
-
         num_query = query_content.shape[0]          # 模式数量 (64)
 
         # 2. 扩展中心对象特征 (Ego Feature Expansion)
-
+        # None就是前面加一个维度1,repeat再复制64份
         # center_objects_feature: (Batch, C) -> (1, Batch, C) -> (num_query, Batch, C)
-
         # 每一个预测模式(Mode)都需要一份主角的历史特征作为基础
 
         center_objects_feature = center_objects_feature[None, :, :].repeat(num_query, 1, 1)
-
         base_map_idxs = None
-
-       
-
+ 
         # 3. 初始化轨迹路点 (Waypoints)
 
         # 在第 0 层，我们将静态的意图锚点作为初始的“预测轨迹”
@@ -657,51 +610,69 @@ class MTRDecoder(nn.Module):
         # 这里的 '1' 代表时间步，此时只有一个终点
 
         pred_waypoints = intention_points.permute(1, 0, 2)[:, :, None, :]
-
-       
-
         # 初始化动态查询中心，用于计算相对位置编码
-
         dynamic_query_center = intention_points
-
         pred_list = []
-
-       
-
         # ============================================================
-
         # 4. 进入迭代解码循环 (Iterative Refinement Loop)
-
         # ============================================================
 
         for layer_idx in range(self.num_decoder_layers):
-
             # --- A. 交互：Agent-Agent Attention ---
-
             # Query (意图) 去关注环境中的其他动态障碍物 (obj_feature)
-
             # 这一步是为了理解“如果不撞车，我该怎么走”
 
             obj_query_feature = self.apply_cross_attention(
+                # 来源是 Encoder 输出的场景中所有 Agent 的历史特征。
+                # 形状: (Batch, Num_Agents, C) -> 比如 (4, 128, 256)
+                kv_feature=obj_feature, 
+                
+                # 掩码：告诉 Attention 哪些 Agent 是真的，哪些是填充(Padding)的空数据，不要看空数据。
+                # 形状: (Batch, Num_Agents)
+                kv_mask=obj_mask,       
+                
+                # 场景中所有 Agent 的历史最后位置 (x, y)。
+                # 用于计算相对位置编码，让 Query 知道这些 Agent 离自己有多远。
+                # 形状: (Batch, Num_Agents, 3)
+                kv_pos=obj_pos,         
 
-                kv_feature=obj_feature, kv_mask=obj_mask, kv_pos=obj_pos,
+                # ================= 查询者 (Target / Query) =================
+                # Query 的"内容"特征。
+                # 第 0 层时通常是全 0 (或者来自主角的特征)，后面几层则是上一层的输出。
+                # 它是 Transformer 真正要更新和学习的向量。
+                # 形状: (num_query, Batch, C) -> 比如 (64, 4, 256)
+                # 随着层数加深，它越来越丰富，包含了“环境里有辆卡车在逼近”这种语义信息
+                query_content=query_content, 
+                
+                # Query 的"位置"嵌入 (Intention Query)。
+                # 代表这 64 个意图锚点最初的几何含义（比如代表左转、直行、右转的向量）
+                # 身份/位置。它告诉模型“我是第 3 号模式，我负责向东北方向预测”
+                # 通常作为 Position Embedding 加在 Content 上
+                # 形状: (num_query, Batch, C)
+                query_embed=intention_query, 
 
-                query_content=query_content, query_embed=intention_query,
+                # ================= 模型组件与辅助信息 =================
+                # 当前使用的 Transformer Decoder 层对象 (里面包含了 Linear 层和 MultiheadAttention)。
+                attention_layer=self.obj_decoder_layers[layer_idx], 
 
-                attention_layer=self.obj_decoder_layers[layer_idx],
+                # 动态锚点中心 (x, y)。
+                # MTR 是层级细化的，每一层预测完后，锚点的位置会动 (Refine)。
+                # 这里传入的是当前这一层锚点在地图上的绝对坐标，用于和 kv_pos 计算相对距离。
+                # 形状: (num_query, Batch, 2)
+                dynamic_query_center=dynamic_query_center, 
 
-                dynamic_query_center=dynamic_query_center,
-
+                # 当前是第几层 Decoder (比如 0, 1, 2...)
                 layer_idx=layer_idx
-
             )
 
+            # 输出 obj_query_feature: 
+            # 经过这一层"吸星大法"后，这 64 个 Query 吸收了环境特征，变得更强了。
+            # 形状: (num_query, Batch, C)
+
+
             # --- B. 动态地图收集 (Dynamic Map Collection) ---
-
             # 这是 MTR 的精髓：不看全图，只看“我当前预测路径”附近的地图
-
             # pred_waypoints: 上一层的预测结果 (或初始锚点)。
-
             # 返回的 collected_idxs 是筛选出的地图线段索引
 
             collected_idxs, base_map_idxs = self.apply_dynamic_map_collection(
@@ -723,81 +694,55 @@ class MTRDecoder(nn.Module):
             )
 
             # --- C. 交互：Agent-Map Attention ---
-
             # Query 去关注刚刚筛选出来的“局部地图特征”
-
             # use_local_attn=True: 说明这是一个稀疏注意力，只计算 collected_idxs 指定的元素
 
             map_query_feature = self.apply_cross_attention(
-
                 kv_feature=map_feature, kv_mask=map_mask, kv_pos=map_pos,
-
                 query_content=query_content, query_embed=intention_query,
-
                 attention_layer=self.map_decoder_layers[layer_idx],
-
                 layer_idx=layer_idx,
-
                 dynamic_query_center=dynamic_query_center,
-
                 use_local_attn=True,
-
-                query_index_pair=collected_idxs, # 传入筛选后的索引
-
+                query_index_pair=collected_idxs, # 传入筛选后的索引 local attention用于只关注附近障碍物
                 query_content_pre_mlp=self.map_query_content_mlps[layer_idx],
-
                 query_embed_pre_mlp=self.map_query_embed_mlps
-
             )
 
             # --- D. 特征融合 (Feature Fusion) ---
-
             # 将三者拼起来：[主角历史, 环境障碍物交互, 地图交互]
-
             query_feature = torch.cat([center_objects_feature, obj_query_feature, map_query_feature], dim=-1)
 
-           
-
             # 使用 MLP 融合特征，更新 query_content
-
             # 更新后的 content 包含了当前层对环境的所有理解
-
+ 
+            # self.query_feature_fusion_layers[layer_idx]()就是个mlp ->  nn.Linear
+            # flatten 把第 0 维和第 1 维合并(相乘)！第 2 维保持原样 -> mlp一般就接受两维的输入
             query_content = self.query_feature_fusion_layers[layer_idx](
-
                 query_feature.flatten(start_dim=0, end_dim=1)
-
             ).view(num_query, num_center_objects, -1)
 
             # --- E. 运动预测 (Motion Prediction Head) ---
-
             # 准备数据: (num_query * Batch, C)
-
+            # 初始：[64个模式][4个路口][256特征]
+            # permute：变形成 [4个路口][64个模式][256特征] （但内存里还是乱的）
+            # contiguous：把内存搬整齐，确保第 1 个路口的 64 个模式在物理上挨在一起。
+            # view：把前两个维度捏扁，变成 [256个待预测的意图][256特征]。
             query_content_t = query_content.permute(1, 0, 2).contiguous().view(num_center_objects * num_query, -1)
-
-           
-
             # 1. 预测概率分数 (Classification)
-
-            pred_scores = self.motion_cls_heads[layer_idx](query_content_t).view(num_center_objects, num_query)
-
-           
+            pred_scores = self.motion_cls_heads[layer_idx](query_content_t).view(num_center_objects, num_query)           
 
             # 2. 预测轨迹 (Regression)
 
             if self.motion_vel_heads is not None:
-
                 # 如果速度头是分开的
-
                 pred_trajs = self.motion_reg_heads[layer_idx](query_content_t).view(num_center_objects, num_query, self.num_future_frames, 5)
-
                 pred_vel = self.motion_vel_heads[layer_idx](query_content_t).view(num_center_objects, num_query, self.num_future_frames, 2)
-
                 pred_trajs = torch.cat((pred_trajs, pred_vel), dim=-1)
 
             else:
 
                 # 否则直接回归 7 个参数 (x, y, heading, v_x, v_y, ...)
-
                 pred_trajs = self.motion_reg_heads[layer_idx](query_content_t).view(num_center_objects, num_query, self.num_future_frames, 7)
 
             # 将当前层的预测结果存入列表 (用于计算 Auxiliary Loss)
@@ -805,25 +750,15 @@ class MTRDecoder(nn.Module):
             pred_list.append([pred_scores, pred_trajs])
 
             # --- F. 迭代更新 (Update for Next Layer) ---
-
             # 这是关键的一步：用当前层预测出来的轨迹，去更新 pred_waypoints
-
             # 下一层循环做 Dynamic Map Collection 时，就会以这个更准的轨迹为中心去搜地图
-
             pred_waypoints = pred_trajs[:, :, :, 0:2]
 
-           
-
-            # 更新 query center (通常取轨迹终点)，用于下一层 Attention 的位置编码基准
-
+            # 更新 query center (通常取轨迹终点)，用于下一层 Attention 的位置编码基
             dynamic_query_center = pred_trajs[:, :, -1, 0:2].contiguous().permute(1, 0, 2)  # (num_query, Batch, 2)
-
         if self.use_place_holder:
-
             raise NotImplementedError
-
         assert len(pred_list) == self.num_decoder_layers
-
         return pred_list
 
     def get_decoder_loss(self, tb_pre_tag=''):
@@ -1081,23 +1016,15 @@ class MTRDecoder(nn.Module):
         # num_polylines: 每个目标周围有多少条地图线段
 
         obj_feature, obj_mask, obj_pos = batch_dict['obj_feature'], batch_dict['obj_mask'], batch_dict['obj_pos']
-
         map_feature, map_mask, map_pos = batch_dict['map_feature'], batch_dict['map_mask'], batch_dict['map_pos']
-
+        # center_objects_feature.size: (num_center_objects, C)
         center_objects_feature = batch_dict['center_objects_feature']
-
-       
-
         num_center_objects, num_objects, _ = obj_feature.shape
-
         num_polylines = map_feature.shape[1]
 
         # 2. 输入投影 (Input Projection)
 
         # 目的：将 Encoder 输出的特征维度映射到 Decoder 的 hidden_dim (d_model)
-
-       
-
         # 2.1 投影中心对象特征
 
         # center_objects_feature: (num_center_objects, C_in) -> (num_center_objects, d_model)
@@ -1169,9 +1096,7 @@ class MTRDecoder(nn.Module):
             # 取最后一层的预测结果，进行 NMS (非极大值抑制) 去重，选出最好的几条轨迹
 
             pred_scores, pred_trajs = self.generate_final_prediction(pred_list=pred_list, batch_dict=batch_dict)
-
-           
-
+ 
             # 将最终结果写入 batch_dict 返回
 
             batch_dict['pred_scores'] = pred_scores  # (num_center_objects, num_modes)
@@ -1182,9 +1107,7 @@ class MTRDecoder(nn.Module):
 
             # === 训练模式 (Training) ===
 
-            # 将 Ground Truth (真值) 存入 forward_ret_dict，稍后在 get_loss 中计算损失
-
-           
+            # 将 Ground Truth (真值) 存入 forward_ret_dict，稍后在 get_loss 中计算损失    
 
             # 目标车的真值轨迹
 
