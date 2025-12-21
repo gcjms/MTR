@@ -95,6 +95,17 @@ class WaymoDataset(DatasetTemplate):
         obj_trajs_past = obj_trajs_full[:, :current_time_index + 1]
         obj_trajs_future = obj_trajs_full[:, current_time_index + 1:]
 
+        # 1. 拿到原始要预测的名单 (原本只包含他车)
+        original_predict_indices = info['tracks_to_predict']['track_index']
+         # 2. 强行把 sdc_track_index (自车) 放在名单的第一个
+        # 我们用一个新列表，把自车放最前面，然后把原本名单里不是自车的都加进来
+        new_predict_indices = [sdc_track_index]
+        for idx in original_predict_indices:
+            if idx != sdc_track_index:
+                new_predict_indices.append(idx)
+        # 3. 覆盖掉原本的变量，确保传给下面函数的是包含自车的名单
+        track_index_to_predict = np.array(new_predict_indices)
+        # 它现在会把自车也当成“感兴趣的智能体”来处理。
         center_objects, track_index_to_predict = self.get_interested_agents(
             track_index_to_predict=track_index_to_predict,
             obj_trajs_full=obj_trajs_full,

@@ -937,20 +937,120 @@ class MTRDecoder(nn.Module):
 
         return loss_reg, tb_dict, disp_dict
 
+    
     def get_loss(self, tb_pre_tag=''):
 
         loss_decoder, tb_dict, disp_dict = self.get_decoder_loss(tb_pre_tag=tb_pre_tag)
 
         loss_dense_prediction, tb_dict, disp_dict = self.get_dense_future_prediction_loss(tb_pre_tag=tb_pre_tag, tb_dict=tb_dict, disp_dict=disp_dict)
+        # 新加一个自车的辅助任务loss
+        # 从pred_traj拿到自车的预测轨迹  # pred_list: 包含每一层 decoder 的预测结果 [[scores, trajs], [scores, trajs], ...]
+        # ['pred_list'][-1][1]： 取最后一层 decoder 的 trajs 部分
+        # pred_traj: (num_center_objects, 6, num_future_frames, 7)
+        # 1. 提取自车预测与真值 (兼容多 Batch 摊平逻辑)
+        # ==========================================================
+        pred_traj = self.forward_ret_dict['pred_list'][-1][1]
+        batch_size = len(self.forward_ret_dict['batch_sample_count'])
+        counts = self.forward_ret_dict['batch_sample_count'] 
+        
+        ego_indices = []
+        cursor = 0
+        for c in counts:
+            ego_indices.append(cursor) # 取得每个场景的第一个 Agent (Ego)
+            cursor += c
+        ego_indices = torch.LongTensor(ego_indices).to(pred_traj.device)
 
-        total_loss = loss_decoder + loss_dense_prediction
+        # 抓取自车 6 条预测线 [BS, 6, 80, 4] (x, y, vx, vy)
+        pred_traj_self = pred_traj[ego_indices, :, :, 0:4]
+        # 抓取自车真值 [BS, 80, 4] 和 掩码 [BS, 80]
+        gt_traj_self = self.forward_ret_dict['center_gt_trajs'][ego_indices, :, 0:4].to(pred_traj.device)
+        gt_mask_self = self.forward_ret_dict['center_gt_trajs_mask'][ego_indices, :].to(pred_traj.device)
+
+        # ==========================================================
+        # 2. 胜者为王 (Winner-Take-All) 逻辑
+        # 只选 6 条里最准的那条来算回归 Loss，避免 6 条线长得一模一样
+        # ==========================================================
+        # 计算 6 条线每条线相对于 GT 的 ADE (平均位移误差)
+        # [BS, 6, 80]
+        dist_per_step = torch.norm(pred_traj_self[:, :, :, 0:2] - gt_traj_self[:, None, :, 0:2], dim=-1)
+        # 只看有效帧 (mask) 的平均误差
+        ade_per_mode = (dist_per_step * gt_mask_self[:, None, :]).sum(dim=-1) / (gt_mask_self.sum(dim=-1, keepdim=True) + 1e-6)
+        # 找到每个 batch 最准的 mode 索引
+        best_mode_idx = torch.argmin(ade_per_mode, dim=-1) # [BS]
+        
+        # 提取那个“天选之子”
+        batch_range = torch.arange(batch_size).to(pred_traj.device)
+        best_pred_traj = pred_traj_self[batch_range, best_mode_idx] # [BS, 80, 4]
+
+        # ==========================================================
+        # 3. 计算自车模仿 Loss (只针对最佳模式)
+        # ==========================================================
+        loss_reg_self = F.l1_loss(best_pred_traj[:, :, 0:2], gt_traj_self[:, :, 0:2], reduction='none')
+        # 应用 Mask
+        loss_reg_self = (loss_reg_self * gt_mask_self[:, :, None]).sum() / (gt_mask_self.sum() * 2.0 + 1e-6)
+        
+        tb_dict[f'{tb_pre_tag}loss_self_imitation'] = loss_reg_self.item()
+        disp_dict[f'{tb_pre_tag}loss_self_imitation'] = loss_reg_self.item()
+
+        # ==========================================================
+        # 4. 自车物理约束 Loss (你的纵向决策灵魂)
+        # 物理规律是普适的，所以我们惩罚所有 6 条线中不合理的加速度
+        # ==========================================================
+        # a. 算速度 (坐标差分) - [BS, 6, 79]
+        v_diff = torch.diff(pred_traj_self[:, :, :, 0:2], dim=2) 
+        v_ego_val = torch.norm(v_diff, dim=-1) / 0.1                
+        
+        # b. 算加速度 - [BS, 6, 78]
+        a_ego = torch.diff(v_ego_val, dim=2) / 0.1
+        
+        # c. 限制加速度: 按照你的要求 [-5.0, 2.0]
+        accel_penalty = torch.relu(a_ego - 2.0) + torch.relu(-5.0 - a_ego)
+        
+        # d. 应用 mask (二次差分后 mask 缩短 2 位)
+        mask_accel = gt_mask_self[:, 2:] 
+        # 只统计有效帧的加速度异常
+        loss_physics = (accel_penalty * mask_accel[:, None, :]).sum() / (mask_accel.sum() * 6.0 + 1e-6)
+        
+        tb_dict[f'{tb_pre_tag}loss_self_physics'] = loss_physics.item()
+
+        # ==========================================================
+        # 5. 汇总到总 Loss
+        # ==========================================================
+        # 给物理约束 0.1 的初始权重。如果自车还是乱跳，就调大 0.1
+        total_loss = loss_decoder + loss_dense_prediction + loss_reg_self + 0.1 * loss_physics
 
         tb_dict[f'{tb_pre_tag}loss'] = total_loss.item()
 
         disp_dict[f'{tb_pre_tag}loss'] = total_loss.item()
 
+        
+        cur_it = self.forward_ret_dict.get('it', 0)
+        if self.training and cur_it % 20 == 0:
+            print("\n" + "="*30)
+            print(f"DEBUG - Iteration: {self.forward_ret_dict['it']}")
+            
+            # 1. 验证自车身份 (看 Index 0 的类型和 ID)
+            # 在 Waymo 中，自车类型通常是 1
+            ego_type = self.forward_ret_dict['center_objects_type'][0].item()
+            print(f"[Ego Check] First Agent Type: {ego_type} (1 is Vehicle)")
+            
+            # 2. 监测你的纵向物理约束 (看看加速度有没有爆表)
+            # a_ego 形状是 [BS, 6, 78]，我们看这个 Batch 里的最大/最小值
+            max_acc = a_ego.max().item()
+            min_acc = a_ego.min().item()
+            print(f"[Physics Check] Ego Accel Range: [{min_acc:.2f}, {max_acc:.2f}] m/s^2")
+            print(f"[Physics Check] Thresholds: [-5.0, 2.0]")
+            
+            # 3. 监测各部分 Loss 占比 (看你的新 Loss 是不是太小没存在感，或者太大导致炸了)
+            print(f"[Loss Check] Original Decoder Loss: {loss_decoder.item():.4f}")
+            print(f"[Loss Check] Ego Imitation Loss: {loss_reg_self.item():.4f}")
+            print(f"[Loss Check] Ego Physics Loss (Weighted): {(0.1 * loss_physics).item():.4f}")
+            print("="*30 + "\n")
+        
         return total_loss, tb_dict, disp_dict
 
+
+    #  64个intention query ->  final 6个预测模式
     def generate_final_prediction(self, pred_list, batch_dict):
 
         pred_scores, pred_trajs = pred_list[-1]
@@ -1117,7 +1217,9 @@ class MTRDecoder(nn.Module):
 
             self.forward_ret_dict['center_gt_final_valid_idx'] = input_dict['center_gt_final_valid_idx']
 
-           
+            self.forward_ret_dict['batch_size'] = batch_dict['batch_size']
+            self.forward_ret_dict['batch_sample_count'] = batch_dict['batch_sample_count']
+            self.forward_ret_dict['it'] = batch_dict.get('it', 0)
 
             # 环境车的真值轨迹 (用于 Dense Future Prediction Loss)
 

@@ -47,7 +47,7 @@ def train_one_epoch(model, optimizer, train_loader, accumulated_iter, optim_cfg,
         
         # 2. 删除此处的 optimizer.zero_grad()，否则无法累积梯度
         # optimizer.zero_grad() 
-
+        batch['it'] = accumulated_iter 
         loss, tb_dict, disp_dict = model(batch)
         
         # 3. Loss 缩放
