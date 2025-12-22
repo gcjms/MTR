@@ -13,7 +13,7 @@ import pickle
 import torch
 
 import torch.nn as nn
-
+import numpy as np
 import torch.nn.functional as F
 
 from mtr.models.utils.transformer import transformer_decoder_layer
@@ -1025,27 +1025,41 @@ class MTRDecoder(nn.Module):
 
         
         cur_it = self.forward_ret_dict.get('it', 0)
-        if self.training and cur_it % 20 == 0:
-            print("\n" + "="*30)
-            print(f"DEBUG - Iteration: {self.forward_ret_dict['it']}")
-            
-            # 1. 验证自车身份 (看 Index 0 的类型和 ID)
-            # 在 Waymo 中，自车类型通常是 1
-            ego_type = self.forward_ret_dict['center_objects_type'][0].item()
-            print(f"[Ego Check] First Agent Type: {ego_type} (1 is Vehicle)")
-            
-            # 2. 监测你的纵向物理约束 (看看加速度有没有爆表)
-            # a_ego 形状是 [BS, 6, 78]，我们看这个 Batch 里的最大/最小值
-            max_acc = a_ego.max().item()
-            min_acc = a_ego.min().item()
-            print(f"[Physics Check] Ego Accel Range: [{min_acc:.2f}, {max_acc:.2f}] m/s^2")
-            print(f"[Physics Check] Thresholds: [-5.0, 2.0]")
-            
-            # 3. 监测各部分 Loss 占比 (看你的新 Loss 是不是太小没存在感，或者太大导致炸了)
-            print(f"[Loss Check] Original Decoder Loss: {loss_decoder.item():.4f}")
-            print(f"[Loss Check] Ego Imitation Loss: {loss_reg_self.item():.4f}")
-            print(f"[Loss Check] Ego Physics Loss (Weighted): {(0.1 * loss_physics).item():.4f}")
-            print("="*30 + "\n")
+        # 每 100 个 iteration 记录一次，避免 IO 过高
+        if self.training and cur_it % 100 == 0: 
+                    with torch.no_grad():
+                        # 1. 身份与类型 (增加判断逻辑)
+                        raw_types = self.forward_ret_dict['center_objects_type']
+                        if torch.is_tensor(raw_types):
+                            ego_types = raw_types[ego_indices].cpu().numpy()
+                        else:
+                            # 如果已经是 numpy 或 list
+                            idx_list = ego_indices.cpu().tolist()
+                            ego_types = [raw_types[i] for i in idx_list]
+
+                        # 2. 轨迹坐标
+                        sample_pred = best_pred_traj[0].detach().cpu().numpy()
+                        sample_gt = gt_traj_self[0].detach().cpu().numpy()
+                        
+                        # 3. 加速度范围
+                        acc_range = [a_ego.min().item(), a_ego.max().item()]
+                        
+                        # 计算位移
+                        pred_dist = np.linalg.norm(sample_pred[-1, :2] - sample_pred[0, :2])
+                        
+                        debug_msg = [
+                            f"\n{'='*20} Iteration: {cur_it} {'='*20}",
+                            f"[Identity] Ego Indices: {ego_indices.cpu().numpy()}",
+                            f"[Identity] Ego Types:   {ego_types}",
+                            f"[Physics]  Acc Range:   {acc_range[0]:.2f} ~ {acc_range[1]:.2f} m/s^2",
+                            f"[Traj]     Ego Start:   {sample_pred[0, :2]}",
+                            f"[Traj]     Ego End:     {sample_pred[-1, :2]}",
+                            f"[Traj]     Ego Dist:    {pred_dist:.2f} meters",
+                            f"[Loss]     Decoder: {loss_decoder.item():.4f} | Imitation: {loss_reg_self.item():.4f} | Physics: {loss_physics.item():.4f}"
+                        ]
+                        
+                        with open("mtr_debug_monitor.log", "a") as f:
+                            f.write("\n".join(debug_msg) + "\n")
         
         return total_loss, tb_dict, disp_dict
 
