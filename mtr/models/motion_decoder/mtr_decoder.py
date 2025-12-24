@@ -960,18 +960,35 @@ class MTRDecoder(nn.Module):
             cursor += c
         ego_indices = torch.LongTensor(ego_indices).to(pred_traj.device)
 
+        # ========== DEBUG: 打印张量形状 ==========
+        # print(f"\n{'='*60}")
+        # print(f"[DEBUG] batch_size (场景数) = {batch_size}")
+        # print(f"[DEBUG] batch_sample_count = {counts}")
+        # print(f"[DEBUG] ↑ 这个列表的含义：每个场景有几个要预测的对象")
+        # print(f"[DEBUG] sum(batch_sample_count) = {sum(counts)} ← 这就是 num_center_objects!")
+        # print(f"[DEBUG] pred_traj.shape = {pred_traj.shape}")
+        # print(f"[DEBUG] ↑ 第一维 {pred_traj.shape[0]} 就是所有场景的预测对象总数")
+        # print(f"[DEBUG] ego_indices = {ego_indices.cpu().tolist()} ← 每个场景的第一个对象（Ego车）")
+        # print(f"{'='*60}\n")
+        # =========================================
+
         # 抓取自车 6 条预测线 [BS, 6, 80, 4] (x, y, vx, vy)
         pred_traj_self = pred_traj[ego_indices, :, :, 0:4]
+        num_modes = pred_traj_self.shape[1]  # 动态获取模式数量
+        
+        # print(f"[DEBUG] pred_traj_self.shape = {pred_traj_self.shape}")
+        # print(f"[DEBUG] num_modes = {num_modes}")
+        
         # 抓取自车真值 [BS, 80, 4] 和 掩码 [BS, 80]
         gt_traj_self = self.forward_ret_dict['center_gt_trajs'][ego_indices, :, 0:4].to(pred_traj.device)
         gt_mask_self = self.forward_ret_dict['center_gt_trajs_mask'][ego_indices, :].to(pred_traj.device)
 
         # ==========================================================
         # 2. 胜者为王 (Winner-Take-All) 逻辑
-        # 只选 6 条里最准的那条来算回归 Loss，避免 6 条线长得一模一样
+        # 只选最准的那条来算回归 Loss，避免多条线长得一模一样
         # ==========================================================
-        # 计算 6 条线每条线相对于 GT 的 ADE (平均位移误差)
-        # [BS, 6, 80]
+        # 计算每条线相对于 GT 的 ADE (平均位移误差)
+        # [BS, num_modes, 80]
         dist_per_step = torch.norm(pred_traj_self[:, :, :, 0:2] - gt_traj_self[:, None, :, 0:2], dim=-1)
         # 只看有效帧 (mask) 的平均误差
         ade_per_mode = (dist_per_step * gt_mask_self[:, None, :]).sum(dim=-1) / (gt_mask_self.sum(dim=-1, keepdim=True) + 1e-6)
@@ -994,22 +1011,60 @@ class MTRDecoder(nn.Module):
 
         # ==========================================================
         # 4. 自车物理约束 Loss (你的纵向决策灵魂)
-        # 物理规律是普适的，所以我们惩罚所有 6 条线中不合理的加速度
+        # 物理规律是普适的，所以我们惩罚所有 num_modes 条线中不合理的加速度
         # ==========================================================
-        # a. 算速度 (坐标差分) - [BS, 6, 79]
+        # a. 算速度 (坐标差分) - [BS, num_modes, 79]
         v_diff = torch.diff(pred_traj_self[:, :, :, 0:2], dim=2) 
         v_ego_val = torch.norm(v_diff, dim=-1) / 0.1                
         
-        # b. 算加速度 - [BS, 6, 78]
+        # b. 算加速度 - [BS, num_modes, 78]
         a_ego = torch.diff(v_ego_val, dim=2) / 0.1
         
+        # print(f"[DEBUG] a_ego.shape = {a_ego.shape}")
+        
+        # ---------------- NEW Step 1: 算出真值(GT)的加速度 ----------------
+        # 我们得先看看“标准答案”是不是也违规了
+        # gt_traj_self: [BS, 80, 4] -> 取前两维(x,y)
+        gt_v_diff = torch.diff(gt_traj_self[:, :, 0:2], dim=1) 
+        gt_v_val = torch.norm(gt_v_diff, dim=-1) / 0.1
+        gt_a_val = torch.diff(gt_v_val, dim=1) / 0.1 # [BS, 78]
+        # ---------------- NEW Step 2: 制作“免责金牌” (Mask) ----------------
+        # 逻辑：如果真值在 [-5, 2] 范围内，模型必须遵守。
+        #      如果真值超出范围（比如 -8），则该帧不计算物理 Loss。
+        #      注意：这里我们要把 mask 扩充到 [BS, 6, 78] 以匹配预测的 6 条线
+        
+        # 这是一个 Bool 矩阵，True 代表“真值是合规的，模型也要合规”
+        gt_physics_valid_mask = (gt_a_val >= -5.0) & (gt_a_val <= 2.0) # [BS, 78]
+        # 扩充到 6 条线的形状
+        gt_physics_valid_mask = gt_physics_valid_mask[:, None, :].repeat(1, num_modes, 1) # [BS, num_modes, 78]
+        
+        # print(f"[DEBUG] gt_physics_valid_mask.shape = {gt_physics_valid_mask.shape}")
+
         # c. 限制加速度: 按照你的要求 [-5.0, 2.0]
         accel_penalty = torch.relu(a_ego - 2.0) + torch.relu(-5.0 - a_ego)
         
-        # d. 应用 mask (二次差分后 mask 缩短 2 位)
-        mask_accel = gt_mask_self[:, 2:] 
+        # print(f"[DEBUG] accel_penalty.shape = {accel_penalty.shape}")
+        
+       
+        # 原有的有效帧 mask (处理 padding)
+        mask_accel = gt_mask_self[:, 2:] # [BS, 78]
+        mask_accel = mask_accel.unsqueeze(1).repeat(1, num_modes, 1) # [BS, num_modes, 78]
+        
+        # print(f"[DEBUG] mask_accel.shape = {mask_accel.shape}")
+        
+        # ★★★ 最终 Mask = 有效帧 Mask AND 真值合规 Mask ★★★
+        # 只有在“既是有效帧”且“真值也没乱来”的时候，才惩罚模型
+        # 0.0 * 1.0 = 0.0 (False)
+        # 1.0 * 1.0 = 1.0 (True)
+        final_mask = mask_accel * gt_physics_valid_mask
+        
+        # print(f"[DEBUG] final_mask.shape = {final_mask.shape}")
+        # print(f"[DEBUG] 现在要计算: accel_penalty ({accel_penalty.shape}) * final_mask ({final_mask.shape})")
+        
+        # 计算 Loss
+        loss_physics = (accel_penalty * final_mask).sum() / (final_mask.sum() + 1e-6)
         # 只统计有效帧的加速度异常
-        loss_physics = (accel_penalty * mask_accel[:, None, :]).sum() / (mask_accel.sum() * 6.0 + 1e-6)
+        # loss_physics = (accel_penalty * mask_accel[:, None, :]).sum() / (mask_accel.sum() * 6.0 + 1e-6)
         
         tb_dict[f'{tb_pre_tag}loss_self_physics'] = loss_physics.item()
 
@@ -1047,19 +1102,19 @@ class MTRDecoder(nn.Module):
                         # 计算位移
                         pred_dist = np.linalg.norm(sample_pred[-1, :2] - sample_pred[0, :2])
                         
-                        debug_msg = [
-                            f"\n{'='*20} Iteration: {cur_it} {'='*20}",
-                            f"[Identity] Ego Indices: {ego_indices.cpu().numpy()}",
-                            f"[Identity] Ego Types:   {ego_types}",
-                            f"[Physics]  Acc Range:   {acc_range[0]:.2f} ~ {acc_range[1]:.2f} m/s^2",
-                            f"[Traj]     Ego Start:   {sample_pred[0, :2]}",
-                            f"[Traj]     Ego End:     {sample_pred[-1, :2]}",
-                            f"[Traj]     Ego Dist:    {pred_dist:.2f} meters",
-                            f"[Loss]     Decoder: {loss_decoder.item():.4f} | Imitation: {loss_reg_self.item():.4f} | Physics: {loss_physics.item():.4f}"
-                        ]
+                        # debug_msg = [
+                        #     f"\n{'='*20} Iteration: {cur_it} {'='*20}",
+                        #     f"[Identity] Ego Indices: {ego_indices.cpu().numpy()}",
+                        #     f"[Identity] Ego Types:   {ego_types}",
+                        #     f"[Physics]  Acc Range:   {acc_range[0]:.2f} ~ {acc_range[1]:.2f} m/s^2",
+                        #     f"[Traj]     Ego Start:   {sample_pred[0, :2]}",
+                        #     f"[Traj]     Ego End:     {sample_pred[-1, :2]}",
+                        #     f"[Traj]     Ego Dist:    {pred_dist:.2f} meters",
+                        #     f"[Loss]     Decoder: {loss_decoder.item():.4f} | Imitation: {loss_reg_self.item():.4f} | Physics: {loss_physics.item():.4f}"
+                        # ]
                         
-                        with open("mtr_debug_monitor.log", "a") as f:
-                            f.write("\n".join(debug_msg) + "\n")
+                        # with open("mtr_debug_monitor.log", "a") as f:
+                        #     f.write("\n".join(debug_msg) + "\n")
         
         return total_loss, tb_dict, disp_dict
 
@@ -1216,6 +1271,47 @@ class MTRDecoder(nn.Module):
             batch_dict['pred_scores'] = pred_scores  # (num_center_objects, num_modes)
 
             batch_dict['pred_trajs'] = pred_trajs    # (num_center_objects, num_modes, num_future, 7)
+
+            # === 打印自车轨迹信息 ===
+            # 确定哪些对象是自车（每个场景的第一个对象）
+            batch_sample_count = batch_dict.get('batch_sample_count', [pred_trajs.shape[0]])
+            ego_indices = []
+            cursor = 0
+            for count in batch_sample_count:
+                ego_indices.append(cursor)
+                cursor += count
+            
+            print("\n" + "="*80)
+            print("【轨迹预测结果】")
+            print("="*80)
+            for obj_idx in range(pred_trajs.shape[0]):
+                # 判断是否为自车
+                is_ego = obj_idx in ego_indices
+                ego_flag = " 🚗 [自车 EGO]" if is_ego else ""
+                
+                print(f"\n目标车辆 #{obj_idx}{ego_flag}:")
+                print(f"  - 车辆类型: {input_dict['center_objects_type'][obj_idx].item()}")
+                print(f"  - 车辆ID: {input_dict['center_objects_id'][obj_idx]}")
+                print(f"  - 预测模态数: {pred_trajs.shape[1]}")
+                print(f"  - 预测时间步: {pred_trajs.shape[2]}")
+                print(f"\n  各模态置信度分数:")
+                for mode_idx in range(pred_scores.shape[1]):
+                    print(f"    模态 {mode_idx}: {pred_scores[obj_idx, mode_idx].item():.4f}")
+                
+                # 打印最高置信度模态的轨迹
+                best_mode = torch.argmax(pred_scores[obj_idx]).item()
+                print(f"\n  最佳模态 (模态 {best_mode}) 的预测轨迹:")
+                print(f"    时间步 | x (m) | y (m) | heading (rad) | vx (m/s) | vy (m/s)")
+                print(f"    " + "-"*70)
+                
+                # 对于自车，打印更多详细信息；其他车只打印前10帧
+                max_frames = 80 if is_ego else min(10, pred_trajs.shape[2])
+                for t in range(min(max_frames, pred_trajs.shape[2])):
+                    traj = pred_trajs[obj_idx, best_mode, t]
+                    print(f"    {t:2d}     | {traj[0]:6.2f} | {traj[1]:6.2f} | {traj[2]:7.4f}   | {traj[3]:7.2f} | {traj[4]:7.2f}")
+                if pred_trajs.shape[2] > max_frames:
+                    print(f"    ... (共 {pred_trajs.shape[2]} 个时间步)")
+            print("="*80 + "\n")
 
         else:
 
