@@ -248,7 +248,7 @@ class MTRDecoder(nn.Module):
 
         return motion_reg_heads, motion_cls_heads, motion_vel_heads
 
-    def apply_dense_future_prediction(self, obj_feature, obj_mask, obj_pos):
+    def apply_dense_future_prediction(self, obj_feature, obj_mask, obj_pos,  ego_gt_trajs=None):
 
             """
 
@@ -332,6 +332,26 @@ class MTRDecoder(nn.Module):
 
             pred_dense_trajs_valid = torch.cat((temp_center, pred_dense_trajs_valid[:, :, 2:]), dim=-1)
 
+            # 如果传入了自车的真值轨迹，则用真值来替换自车的预测结果
+            if ego_gt_trajs is not None:
+                # 在 MTR/Waymo 数据集里，每个场景的第 0 个 agent 就是自车
+                # 我们需要找到它在 pred_dense_trajs_valid 里的对应行
+                batch_size = obj_mask.shape[0]
+                ego_valid_ids = []
+                current_idx = 0
+                for b  in range(batch_size):
+                    ego_valid_ids.append(current_idx)
+                    current_idx += obj_mask[b].sum().item()
+                    # pred_dense_trajs_valid: (M, T_future, 7)
+                    # ego_gt_trajs: (B, T_future, 7)
+                ego_gt = ego_gt_trajs.cuda().type_as(pred_dense_trajs_valid)
+                # 假设 ego_gt_trajs 的 4 维是 [x, y, vx, vy]
+                pred_dense_trajs_valid[ego_valid_ids, :, 0] = ego_gt[:, :, 0] # x
+                pred_dense_trajs_valid[ego_valid_ids, :, 1] = ego_gt[:, :, 1] # y
+                pred_dense_trajs_valid[ego_valid_ids, :, -2] = ego_gt[:, :, 2] # vx
+                pred_dense_trajs_valid[ego_valid_ids, :, -1] = ego_gt[:, :, 3] # vy
+
+
             # ============================================================
 
             # 4. 未来特征反哺 (Feature Update)
@@ -381,9 +401,7 @@ class MTRDecoder(nn.Module):
             ret_pred_dense_future_trajs = obj_feature.new_zeros(num_center_objects, num_objects, self.num_future_frames, 7)
 
             ret_pred_dense_future_trajs[obj_mask] = pred_dense_trajs_valid
-
-           
-
+ 
             # 存入字典，供 Loss 计算模块使用
 
             self.forward_ret_dict['pred_dense_trajs'] = ret_pred_dense_future_trajs
@@ -982,7 +1000,17 @@ class MTRDecoder(nn.Module):
         # 抓取自车真值 [BS, 80, 4] 和 掩码 [BS, 80]
         gt_traj_self = self.forward_ret_dict['center_gt_trajs'][ego_indices, :, 0:4].to(pred_traj.device)
         gt_mask_self = self.forward_ret_dict['center_gt_trajs_mask'][ego_indices, :].to(pred_traj.device)
-
+         # ==================== 新增：Size 打印调试 ====================
+        print(f"\n" + ">"*20 + " [DEBUG: Ego GT Info] " + "<"*20)
+        print(f"| ego_indices (自车索引): {ego_indices.tolist()}")
+        print(f"| batch_size (场景数):     {len(ego_indices)}")
+        print(f"| gt_traj_self.shape:     {gt_traj_self.shape}  # 期望: (Batch_Size, 80, 4)")
+        print(f"| gt_mask_self.shape:     {gt_mask_self.shape}  # 期望: (Batch_Size, 80)")
+        
+        # 额外检查一下是否有全 0 或者全无效的情况
+        print(f"| 有效帧总数:             {gt_mask_self.sum().item()}")
+        print("-" * 62 + "\n")
+        # ==========================================================
         # ==========================================================
         # 2. 胜者为王 (Winner-Take-All) 逻辑
         # 只选最准的那条来算回归 Loss，避免多条线长得一模一样
@@ -1227,11 +1255,17 @@ class MTRDecoder(nn.Module):
         # 关键点：它会将预测出的“未来信息”编码后融合回 obj_feature 中。
 
         # 结果：现在的 obj_feature 不仅包含了过去，还包含了对未来的“预判”，增强了上下文信息。
+        batch_sample_count = batch_dict['batch_sample_count']
+        ego_indices = []
+        cursor = 0
+        for c in batch_sample_count:
+            ego_indices.append(cursor) # 找到每个场景自车的索引
+            cursor += c
 
+        # 专门提取出自车的 GT 轨迹
+        ego_gt_trajs = input_dict['center_gt_trajs'][ego_indices] 
         obj_feature, pred_dense_future_trajs = self.apply_dense_future_prediction(
-
-            obj_feature=obj_feature, obj_mask=obj_mask, obj_pos=obj_pos
-
+            obj_feature=obj_feature, obj_mask=obj_mask, obj_pos=obj_pos,ego_gt_trajs=ego_gt_trajs # 传入自车的真值
         )
 
         # 4. 进入核心解码器循环 (Decoder Layers) -- 全文最重要部分
@@ -1274,44 +1308,44 @@ class MTRDecoder(nn.Module):
 
             # === 打印自车轨迹信息 ===
             # 确定哪些对象是自车（每个场景的第一个对象）
-            batch_sample_count = batch_dict.get('batch_sample_count', [pred_trajs.shape[0]])
-            ego_indices = []
-            cursor = 0
-            for count in batch_sample_count:
-                ego_indices.append(cursor)
-                cursor += count
+            # batch_sample_count = batch_dict.get('batch_sample_count', [pred_trajs.shape[0]])
+            # ego_indices = []
+            # cursor = 0
+            # for count in batch_sample_count:
+            #     ego_indices.append(cursor)
+            #     cursor += count
             
-            print("\n" + "="*80)
-            print("【轨迹预测结果】")
-            print("="*80)
-            for obj_idx in range(pred_trajs.shape[0]):
-                # 判断是否为自车
-                is_ego = obj_idx in ego_indices
-                ego_flag = " 🚗 [自车 EGO]" if is_ego else ""
+            # print("\n" + "="*80)
+            # print("【轨迹预测结果】")
+            # print("="*80)
+            # for obj_idx in range(pred_trajs.shape[0]):
+            #     # 判断是否为自车
+            #     is_ego = obj_idx in ego_indices
+                # ego_flag = " 🚗 [自车 EGO]" if is_ego else ""
                 
-                print(f"\n目标车辆 #{obj_idx}{ego_flag}:")
-                print(f"  - 车辆类型: {input_dict['center_objects_type'][obj_idx].item()}")
-                print(f"  - 车辆ID: {input_dict['center_objects_id'][obj_idx]}")
-                print(f"  - 预测模态数: {pred_trajs.shape[1]}")
-                print(f"  - 预测时间步: {pred_trajs.shape[2]}")
-                print(f"\n  各模态置信度分数:")
-                for mode_idx in range(pred_scores.shape[1]):
-                    print(f"    模态 {mode_idx}: {pred_scores[obj_idx, mode_idx].item():.4f}")
+                # print(f"\n目标车辆 #{obj_idx}{ego_flag}:")
+                # print(f"  - 车辆类型: {input_dict['center_objects_type'][obj_idx].item()}")
+                # print(f"  - 车辆ID: {input_dict['center_objects_id'][obj_idx]}")
+                # print(f"  - 预测模态数: {pred_trajs.shape[1]}")
+                # print(f"  - 预测时间步: {pred_trajs.shape[2]}")
+                # print(f"\n  各模态置信度分数:")
+                # for mode_idx in range(pred_scores.shape[1]):
+                #     print(f"    模态 {mode_idx}: {pred_scores[obj_idx, mode_idx].item():.4f}")
                 
-                # 打印最高置信度模态的轨迹
-                best_mode = torch.argmax(pred_scores[obj_idx]).item()
-                print(f"\n  最佳模态 (模态 {best_mode}) 的预测轨迹:")
-                print(f"    时间步 | x (m) | y (m) | heading (rad) | vx (m/s) | vy (m/s)")
-                print(f"    " + "-"*70)
+                # # 打印最高置信度模态的轨迹
+                # best_mode = torch.argmax(pred_scores[obj_idx]).item()
+                # print(f"\n  最佳模态 (模态 {best_mode}) 的预测轨迹:")
+                # print(f"    时间步 | x (m) | y (m) | heading (rad) | vx (m/s) | vy (m/s)")
+                # print(f"    " + "-"*70)
                 
                 # 对于自车，打印更多详细信息；其他车只打印前10帧
-                max_frames = 80 if is_ego else min(10, pred_trajs.shape[2])
-                for t in range(min(max_frames, pred_trajs.shape[2])):
-                    traj = pred_trajs[obj_idx, best_mode, t]
-                    print(f"    {t:2d}     | {traj[0]:6.2f} | {traj[1]:6.2f} | {traj[2]:7.4f}   | {traj[3]:7.2f} | {traj[4]:7.2f}")
-                if pred_trajs.shape[2] > max_frames:
-                    print(f"    ... (共 {pred_trajs.shape[2]} 个时间步)")
-            print("="*80 + "\n")
+            #     max_frames = 80 if is_ego else min(10, pred_trajs.shape[2])
+            #     for t in range(min(max_frames, pred_trajs.shape[2])):
+            #         traj = pred_trajs[obj_idx, best_mode, t]
+            #         print(f"    {t:2d}     | {traj[0]:6.2f} | {traj[1]:6.2f} | {traj[2]:7.4f}   | {traj[3]:7.2f} | {traj[4]:7.2f}")
+            #     if pred_trajs.shape[2] > max_frames:
+            #         print(f"    ... (共 {pred_trajs.shape[2]} 个时间步)")
+            # print("="*80 + "\n")
 
         else:
 
