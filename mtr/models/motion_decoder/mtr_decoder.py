@@ -342,14 +342,25 @@ class MTRDecoder(nn.Module):
                 for b  in range(batch_size):
                     ego_valid_ids.append(current_idx)
                     current_idx += obj_mask[b].sum().item()
-                    # pred_dense_trajs_valid: (M, T_future, 7)
-                    # ego_gt_trajs: (B, T_future, 7)
-                ego_gt = ego_gt_trajs.cuda().type_as(pred_dense_trajs_valid)
-                # 假设 ego_gt_trajs 的 4 维是 [x, y, vx, vy]
-                pred_dense_trajs_valid[ego_valid_ids, :, 0] = ego_gt[:, :, 0] # x
-                pred_dense_trajs_valid[ego_valid_ids, :, 1] = ego_gt[:, :, 1] # y
-                pred_dense_trajs_valid[ego_valid_ids, :, -2] = ego_gt[:, :, 2] # vx
-                pred_dense_trajs_valid[ego_valid_ids, :, -1] = ego_gt[:, :, 3] # vy
+                
+                # 【关键】坐标系转换
+                # ego_gt_trajs: (B, T_future, 4) 是相对于自车起始位置的局部坐标 [dx, dy, vx, vy]
+                # obj_pos_valid[ego_valid_ids]: (B, 2) 是自车在统一坐标系下的当前位置 [x0, y0]
+                # pred_dense_trajs_valid 在 line 329 之后存储的是绝对坐标
+                # 因此需要: 局部坐标 + 自车起始位置 = 绝对坐标
+                
+                ego_gt = ego_gt_trajs.cuda().type_as(pred_dense_trajs_valid)  # (B, T_future, 4)
+                ego_pos_abs = obj_pos_valid[ego_valid_ids]  # (B, 2) 自车的绝对位置
+                
+                # 转换到绝对坐标系：真值的相对坐标 + 自车当前绝对位置
+                ego_gt_abs_x = ego_gt[:, :, 0] + ego_pos_abs[:, None, 0]  # (B, T_future)
+                ego_gt_abs_y = ego_gt[:, :, 1] + ego_pos_abs[:, None, 1]  # (B, T_future)
+                
+                # 赋值到预测结果（现在坐标系一致了）
+                pred_dense_trajs_valid[ego_valid_ids, :, 0] = ego_gt_abs_x    # x 绝对坐标
+                pred_dense_trajs_valid[ego_valid_ids, :, 1] = ego_gt_abs_y    # y 绝对坐标
+                pred_dense_trajs_valid[ego_valid_ids, :, -2] = ego_gt[:, :, 2] # vx 速度不需要转换
+                pred_dense_trajs_valid[ego_valid_ids, :, -1] = ego_gt[:, :, 3] # vy 速度不需要转换
 
 
             # ============================================================
@@ -978,40 +989,18 @@ class MTRDecoder(nn.Module):
             cursor += c
         ego_indices = torch.LongTensor(ego_indices).to(pred_traj.device)
 
-        # ========== DEBUG: 打印张量形状 ==========
-        # print(f"\n{'='*60}")
-        # print(f"[DEBUG] batch_size (场景数) = {batch_size}")
-        # print(f"[DEBUG] batch_sample_count = {counts}")
-        # print(f"[DEBUG] ↑ 这个列表的含义：每个场景有几个要预测的对象")
-        # print(f"[DEBUG] sum(batch_sample_count) = {sum(counts)} ← 这就是 num_center_objects!")
-        # print(f"[DEBUG] pred_traj.shape = {pred_traj.shape}")
-        # print(f"[DEBUG] ↑ 第一维 {pred_traj.shape[0]} 就是所有场景的预测对象总数")
-        # print(f"[DEBUG] ego_indices = {ego_indices.cpu().tolist()} ← 每个场景的第一个对象（Ego车）")
-        # print(f"{'='*60}\n")
-        # =========================================
-
-        # 抓取自车 6 条预测线 [BS, 6, 80, 4] (x, y, vx, vy)
-        pred_traj_self = pred_traj[ego_indices, :, :, 0:4]
-        num_modes = pred_traj_self.shape[1]  # 动态获取模式数量
-        
-        # print(f"[DEBUG] pred_traj_self.shape = {pred_traj_self.shape}")
-        # print(f"[DEBUG] num_modes = {num_modes}")
+        # 抓取自车预测轨迹 [BS, num_modes, 80, 4] -> (x, y, vx, vy)
+        # pred_traj维度: [..., 7] = [x, y, GMM_σx, GMM_σy, GMM_ρ, vx, vy]
+        # 需要提取索引 [0, 1, 5, 6]
+        pred_traj_self = torch.cat([
+            pred_traj[ego_indices, :, :, 0:2],  # x, y
+            pred_traj[ego_indices, :, :, 5:7]   # vx, vy
+        ], dim=-1)  # [BS, num_modes, 80, 4]
+        num_modes = pred_traj_self.shape[1]
         
         # 抓取自车真值 [BS, 80, 4] 和 掩码 [BS, 80]
         gt_traj_self = self.forward_ret_dict['center_gt_trajs'][ego_indices, :, 0:4].to(pred_traj.device)
         gt_mask_self = self.forward_ret_dict['center_gt_trajs_mask'][ego_indices, :].to(pred_traj.device)
-         # ==================== 新增：Size 打印调试 ====================
-        print(f"\n" + ">"*20 + " [DEBUG: Ego GT Info] " + "<"*20)
-        print(f"| ego_indices (自车索引): {ego_indices.tolist()}")
-        print(f"| batch_size (场景数):     {len(ego_indices)}")
-        print(f"| gt_traj_self.shape:     {gt_traj_self.shape}  # 期望: (Batch_Size, 80, 4)")
-        print(f"| gt_mask_self.shape:     {gt_mask_self.shape}  # 期望: (Batch_Size, 80)")
-        
-        # 额外检查一下是否有全 0 或者全无效的情况
-        print(f"| 有效帧总数:             {gt_mask_self.sum().item()}")
-        print("-" * 62 + "\n")
-        # ==========================================================
-        # ==========================================================
         # 2. 胜者为王 (Winner-Take-All) 逻辑
         # 只选最准的那条来算回归 Loss，避免多条线长得一模一样
         # ==========================================================
@@ -1038,17 +1027,16 @@ class MTRDecoder(nn.Module):
         disp_dict[f'{tb_pre_tag}loss_self_imitation'] = loss_reg_self.item()
 
         # ==========================================================
-        # 4. 自车物理约束 Loss (你的纵向决策灵魂)
+        # 4. 自车物理约束 Loss
         # 物理规律是普适的，所以我们惩罚所有 num_modes 条线中不合理的加速度
         # ==========================================================
-        # a. 算速度 (坐标差分) - [BS, num_modes, 79]
-        v_diff = torch.diff(pred_traj_self[:, :, :, 0:2], dim=2) 
-        v_ego_val = torch.norm(v_diff, dim=-1) / 0.1                
+        # a. 提取预测的速度 (直接从vx, vy计算) - [BS, num_modes, 80]
+        pred_vx = pred_traj_self[:, :, :, 2]  # vx
+        pred_vy = pred_traj_self[:, :, :, 3]  # vy
+        v_ego_val = torch.sqrt(pred_vx**2 + pred_vy**2)  # 速度大小
         
-        # b. 算加速度 - [BS, num_modes, 78]
-        a_ego = torch.diff(v_ego_val, dim=2) / 0.1
-        
-        # print(f"[DEBUG] a_ego.shape = {a_ego.shape}")
+        # b. 算加速度 (速度的时间导数) - [BS, num_modes, 79]
+        a_ego = torch.diff(v_ego_val, dim=2) / 0.1  # 假设dt=0.1s
         
         # ---------------- NEW Step 1: 算出真值(GT)的加速度 ----------------
         # 我们得先看看“标准答案”是不是也违规了
