@@ -132,7 +132,7 @@ def decode_map_features_from_proto(map_features):
 
         else:
             print(cur_data)
-            pass
+            raise ValueError
 
         polylines.append(cur_polyline)
         cur_info['polyline_index'] = (point_cnt, point_cnt + len(cur_polyline))

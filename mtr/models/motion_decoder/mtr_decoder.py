@@ -404,28 +404,65 @@ class MTRDecoder(nn.Module):
         # ========== End of Batch Conditional Query Modulation ==========
 
         base_map_idxs = None
-        # Initial waypoints are the intention points themselves
+        # 3. 初始化轨迹路点 (Waypoints)
+        # 在第 0 层，我们将静态的意图锚点作为初始的"预测轨迹"
+        # 形状变换: (num_query, Batch, 2) -> (Batch, num_query, 2) -> (Batch, num_query, 1, 2)
+        # 这里的 '1' 代表时间步，此时只有一个终点
         pred_waypoints = intention_points.permute(1, 0, 2)[:, :, None, :]  # (num_center_objects, num_query, 1, 2)
+        # 初始化动态查询中心，用于计算相对位置编码
         dynamic_query_center = intention_points
 
         pred_list = []
-        # Cascade Decoder Layers
+        # 4. 进入迭代解码循环 (Iterative Refinement Loop)
         # 每一层不仅会精细化特征，还会更新预测的轨迹
         for layer_idx in range(self.num_decoder_layers):
-            # 1. 查询障碍物特征 (Query Agent Features)
+            # --- A. 交互：Agent-Agent Attention ---
+            # Query (意图) 去关注环境中的其他动态障碍物 (obj_feature)
+            # 这一步是为了理解"如果不撞车，我该怎么走"
+            #
+            # ================= 键值对 (Source / Key-Value) =================
+            # kv_feature: 来源是 Encoder 输出的场景中所有 Agent 的历史特征。
+            #             形状: (Batch, Num_Agents, C) -> 比如 (4, 128, 256)
+            # kv_mask:    掩码：告诉 Attention 哪些 Agent 是真的，哪些是填充(Padding)的空数据，不要看空数据。
+            #             形状: (Batch, Num_Agents)
+            # kv_pos:     场景中所有 Agent 的历史最后位置 (x, y)。
+            #             用于计算相对位置编码，让 Query 知道这些 Agent 离自己有多远。
+            #             形状: (Batch, Num_Agents, 3)
+            #
+            # ================= 查询方 (Target / Query) =================
+            # query_content: Query 的"内容"特征。
+            #                第 0 层时通常是全 0 (或者来自主角的特征)，后面几层则是上一层的输出。
+            #                它是 Transformer 真正要更新和学习的向量。
+            #                形状: (num_query, Batch, C) -> 比如 (64, 4, 256)
+            #                随着层数加深，它越来越丰富，包含了"环境里有辆卡车在逼近"这种语义信息
+            # query_embed:   Query 的"位置"嵌入 (Intention Query)。
+            #                代表这 64 个意图锚点最初的几何含义（比如代表左转、直行、右转的向量）
+            #                身份/位置。它告诉模型"我是第 3 号模式，我负责向东北方向预测"
+            #                通常作为 Position Embedding 加在 Content 上
+            #                形状: (num_query, Batch, C)
+            # dynamic_query_center: 动态锚点中心 (x, y)。
+            #                       MTR 是层级细化的，每一层预测完后，锚点的位置会更新 (Refine)。
+            #                       这里传入的是当前这一层锚点在地图上的绝对坐标，用于和 kv_pos 计算相对距离。
+            #                       形状: (num_query, Batch, 2)
+            #
             obj_query_feature = self.apply_cross_attention(
                 kv_feature=obj_feature, kv_mask=obj_mask, kv_pos=obj_pos,
                 query_content=query_content, query_embed=intention_query,
                 attention_layer=self.obj_decoder_layers[layer_idx],
                 dynamic_query_center=dynamic_query_center,
                 layer_idx=layer_idx
-            ) 
+            )
+            # 输出 obj_query_feature: 
+            # 经过这一次"吸星大法"后，这 64 个 Query 吸收了环境特征，变得更强了。
+            # 形状: (num_query, Batch, C) 
 
-            # 2. 动态收集并查询地图特征 (Query Map Features)
-            # 根据当前的预测位置，去寻找附近的地图信息
+            # --- B. 动态地图收集 (Dynamic Map Collection) ---
+            # 这是 MTR 的精髓：不看全图，只看"我当前预测路径"附近的地图
+            # pred_waypoints: 上一层的预测结果 (或初始锚点)
+            # 返回的 collected_idxs 是筛选出的地图线段索引
             collected_idxs, base_map_idxs = self.apply_dynamic_map_collection(
                 map_pos=map_pos, map_mask=map_mask,
-                pred_waypoints=pred_waypoints,
+                pred_waypoints=pred_waypoints,  # <--- 关键：用上一轮的预测去搜地图
                 base_region_offset=self.model_cfg.CENTER_OFFSET_OF_MAP,
                 num_waypoint_polylines=self.model_cfg.NUM_WAYPOINT_MAP_POLYLINES,
                 num_base_polylines=self.model_cfg.NUM_BASE_MAP_POLYLINES,
@@ -433,6 +470,9 @@ class MTRDecoder(nn.Module):
                 num_query=num_query
             )
 
+            # --- C. 交互：Agent-Map Attention ---
+            # Query 去关注刚刚筛选出来的"局部地图特征"
+            # use_local_attn=True: 说明这是一个稀疏注意力，只计算 collected_idxs 指定的元素
             map_query_feature = self.apply_cross_attention(
                 kv_feature=map_feature, kv_mask=map_mask, kv_pos=map_pos,
                 query_content=query_content, query_embed=intention_query,
@@ -440,34 +480,54 @@ class MTRDecoder(nn.Module):
                 layer_idx=layer_idx,
                 dynamic_query_center=dynamic_query_center,
                 use_local_attn=True,
-                query_index_pair=collected_idxs,
+                query_index_pair=collected_idxs,  # 传入筛选后的索引, local attention用于只关注附近障碍物
                 query_content_pre_mlp=self.map_query_content_mlps[layer_idx],
                 query_embed_pre_mlp=self.map_query_embed_mlps
             ) 
 
-            # 3. 特征融合 (Fusion)
-            # 融合 原始Agent特征 + 交互后的Agent特征 +交互后的地图特征
+            # --- D. 特征融合 (Feature Fusion) ---
+            # 将三者拼起来：[主角历史, 环境障碍物交互, 地图交互]
             query_feature = torch.cat([center_objects_feature, obj_query_feature, map_query_feature], dim=-1)
+
+            # 使用 MLP 融合特征，更新 query_content
+            # 更新后的 content 包含了当前层对环境的所有理解 
+            # self.query_feature_fusion_layers[layer_idx]() 就是个 MLP -> nn.Linear
+            # flatten 把第 0 维和第 1 维合并(相乘)！第 2 维保持原样 -> MLP一般就接受两维的输入
             query_content = self.query_feature_fusion_layers[layer_idx](
                 query_feature.flatten(start_dim=0, end_dim=1)
             ).view(num_query, num_center_objects, -1) 
 
-            # 4. 运动预测 (Motion Prediction)
-            # 基于更新后的特征，预测概率分数和轨迹
+            # --- E. 运动预测 (Motion Prediction Head) ---
+            # 准备数据: (num_query * Batch, C)
+            # 初始：[64个模式][4个路口][256特征]
+            # permute：变形成 [4个路口][64个模式][256特征] （但内存里还是乱的）
+            # contiguous：把内存搬整齐，确保第 1 个路口的 64 个模式在物理上挨在一起。
+            # view：把前两个维度捏扁，变成 [256个待预测的意图][256特征]。
             query_content_t = query_content.permute(1, 0, 2).contiguous().view(num_center_objects * num_query, -1)
+            
+            # 1. 预测概率分数 (Classification)
             pred_scores = self.motion_cls_heads[layer_idx](query_content_t).view(num_center_objects, num_query)
+            
+            # 2. 预测轨迹 (Regression)
             if self.motion_vel_heads is not None:
+                # 如果速度头是分开的
                 pred_trajs = self.motion_reg_heads[layer_idx](query_content_t).view(num_center_objects, num_query, self.num_future_frames, 5)
                 pred_vel = self.motion_vel_heads[layer_idx](query_content_t).view(num_center_objects, num_query, self.num_future_frames, 2)
                 pred_trajs = torch.cat((pred_trajs, pred_vel), dim=-1)
             else:
+                # 否则直接回归 7 个参数 (x, y, heading, v_x, v_y, ...)
                 pred_trajs = self.motion_reg_heads[layer_idx](query_content_t).view(num_center_objects, num_query, self.num_future_frames, 7)
 
+            # 将当前层的预测结果存入列表 (用于计算 Auxiliary Loss)
             pred_list.append([pred_scores, pred_trajs])
 
-            # 5. 更新用于下一层的查询位置 (Iterative Refinement)
+            # --- F. 迭代更新 (Update for Next Layer) ---
+            # 这是关键的一步：用当前层预测出来的轨迹，去更新 pred_waypoints
+            # 下一层循环做 Dynamic Map Collection 时，就会以这个更准的轨迹为中心去搜地图
             pred_waypoints = pred_trajs[:, :, :, 0:2]
-            dynamic_query_center = pred_trajs[:, :, -1, 0:2].contiguous().permute(1, 0, 2)  # (num_query, num_center_objects, 2)
+            
+            # 更新 query center (通常取轨迹终点)，用于下一层 Attention 的位置编码基准
+            dynamic_query_center = pred_trajs[:, :, -1, 0:2].contiguous().permute(1, 0, 2)  # (num_query, Batch, 2)
 
         if self.use_place_holder:
             raise NotImplementedError
@@ -693,63 +753,105 @@ class MTRDecoder(nn.Module):
         return pred_scores_final, pred_trajs_final
 
     def forward(self, batch_dict):
+        """
+        MTR Decoder 的前向传播入口
+       
+        Args:
+            batch_dict: 包含所有输入信息的字典
+                - obj_feature: (num_center_objects, num_objects, C_in)  环境中的其他障碍物特征
+                - obj_mask: (num_center_objects, num_objects)           障碍物掩码 (1有效, 0无效)
+                - map_feature: (num_center_objects, num_polylines, C_in) 地图车道线特征
+                - center_objects_feature: (num_center_objects, C_in)     我们要预测的目标(中心)对象的特征
+        """
         input_dict = batch_dict['input_dict']
+        
+        # 1. 解包 Encoder 传过来的特征
+        # num_center_objects: 当前 Batch 里一共要预测多少个目标 (相当于 Batch Size)
+        # num_objects: 每个目标周围有多少个环境障碍物 (context agents)
+        # num_polylines: 每个目标周围有多少条地图线段
         obj_feature, obj_mask, obj_pos = batch_dict['obj_feature'], batch_dict['obj_mask'], batch_dict['obj_pos']
         map_feature, map_mask, map_pos = batch_dict['map_feature'], batch_dict['map_mask'], batch_dict['map_pos']
+        # center_objects_feature.size: (num_center_objects, C)
         center_objects_feature = batch_dict['center_objects_feature']
         num_center_objects, num_objects, _ = obj_feature.shape
         num_polylines = map_feature.shape[1]
 
-        # input projection
+        # 2. 输入投影 (Input Projection)
+        # 目的：将 Encoder 输出的特征维度映射到 Decoder 的 hidden_dim (d_model)
+        
+        # 2.1 投影中心对象特征
+        # center_objects_feature: (num_center_objects, C_in) -> (num_center_objects, d_model)
         center_objects_feature = self.in_proj_center_obj(center_objects_feature)
+        
+        # 2.2 投影环境障碍物特征 (只计算有效元素以节省算力)
+        # obj_feature[obj_mask] -> 选出所有有效的障碍物，形状变成 (Total_Valid_Objs, C_in)
         obj_feature_valid = self.in_proj_obj(obj_feature[obj_mask])
+        # 创建全 0 容器并填回
         obj_feature = obj_feature.new_zeros(num_center_objects, num_objects, obj_feature_valid.shape[-1])
         obj_feature[obj_mask] = obj_feature_valid
 
+        # 2.3 投影地图特征 (同理，只计算有效元素)
         map_feature_valid = self.in_proj_map(map_feature[map_mask])
         map_feature = map_feature.new_zeros(num_center_objects, num_polylines, map_feature_valid.shape[-1])
         map_feature[map_mask] = map_feature_valid
 
-        # dense future prediction
+        # 3. 致密未来预测 (Dense Future Prediction) -- 这是一个辅助任务
+        # 作用：不仅预测中心车，还顺便预测周围所有障碍物的未来轨迹。单纯MLP 不用Transform
+        # 关键点：它会将预测出的"未来信息"编码后融合回 obj_feature 中。
+        # 结果：现在的 obj_feature 不仅包含了过去，还包含了对未来的"预判"，增强了上下文信息。
         obj_feature, pred_dense_future_trajs = self.apply_dense_future_prediction(
             obj_feature=obj_feature, obj_mask=obj_mask, obj_pos=obj_pos
         )
         
-        # ========== NEW: Conditional Encoding ==========
-        # [Purpose] Encode ego candidate trajectories into condition vectors
-        # [Input] ego_future_candidates: (num_center_objects, K, T, 2) or None
-        # [Output] condition_vector: (num_center_objects, K, d_model) or None
+        # ========== NEW: Conditional Encoding (条件编码) ==========
+        # [目的] 将自车候选轨迹编码为条件向量
+        # [输入] ego_future_candidates: (num_center_objects, K, T, 2) 或 None
+        # [输出] condition_vector: (num_center_objects, K, d_model) 或 None
         condition_vector = None
         if 'ego_future_candidates' in input_dict and input_dict['ego_future_candidates'] is not None:
             ego_candidates = input_dict['ego_future_candidates'].cuda()
-            # Encode the K candidate trajectories
+            # 编码 K 条候选轨迹
             condition_vector = self.condition_encoder(ego_candidates)
             # condition_vector shape: (num_center_objects, K, d_model)
         # ========== End of Conditional Encoding ==========
         
-        # decoder layers
+        # 4. 进入核心解码器循环 (Decoder Layers) -- 全文最重要部分
+        # 这里执行了: Intention Query -> Cross Attention -> Dynamic Map Collection -> Trajectory Update
+        # pred_list: 包含每一层 decoder 的预测结果 [[scores, trajs], [scores, trajs], ...]
         pred_list = self.apply_transformer_decoder(
             center_objects_feature=center_objects_feature,
             center_objects_type=input_dict['center_objects_type'],
             obj_feature=obj_feature, obj_mask=obj_mask, obj_pos=obj_pos,
             map_feature=map_feature, map_mask=map_mask, map_pos=map_pos,
-            condition_vector=condition_vector  # NEW: Pass condition vector
+            condition_vector=condition_vector  # NEW: 传入条件向量
         )
 
+        # 将预测结果存入字典，供 Loss 计算使用
         self.forward_ret_dict['pred_list'] = pred_list
 
+        # 5. 根据模式处理输出
         if not self.training:
+            # === 推理模式 (Inference) ===
+            # 取最后一层的预测结果，进行 NMS (非极大值抑制) 去重，选出最好的几条轨迹
             pred_scores, pred_trajs = self.generate_final_prediction(pred_list=pred_list, batch_dict=batch_dict)
-            batch_dict['pred_scores'] = pred_scores
-            batch_dict['pred_trajs'] = pred_trajs
+            # 将最终结果写入 batch_dict 返回
+            batch_dict['pred_scores'] = pred_scores  # (num_center_objects, num_modes)
+            batch_dict['pred_trajs'] = pred_trajs    # (num_center_objects, num_modes, num_future, 7)
 
         else:
+            # === 训练模式 (Training) ===
+            # 将 Ground Truth (真值) 存入 forward_ret_dict，稍后在 get_loss 中计算损失    
+            
+            # 目标车的真值轨迹
             self.forward_ret_dict['center_gt_trajs'] = input_dict['center_gt_trajs']
             self.forward_ret_dict['center_gt_trajs_mask'] = input_dict['center_gt_trajs_mask']
             self.forward_ret_dict['center_gt_final_valid_idx'] = input_dict['center_gt_final_valid_idx']
+            
+            # 环境车的真值轨迹 (用于 Dense Future Prediction Loss)
             self.forward_ret_dict['obj_trajs_future_state'] = input_dict['obj_trajs_future_state']
             self.forward_ret_dict['obj_trajs_future_mask'] = input_dict['obj_trajs_future_mask']
 
+            # 对象类型 (用于按类别统计 Metrics)
             self.forward_ret_dict['center_objects_type'] = input_dict['center_objects_type']
 
         return batch_dict

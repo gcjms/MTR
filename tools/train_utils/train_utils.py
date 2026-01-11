@@ -10,10 +10,19 @@ import torch
 import tqdm
 from torch.nn.utils import clip_grad_norm_
 
+
 def train_one_epoch(model, optimizer, train_loader, accumulated_iter, optim_cfg,
                     rank, tbar, total_it_each_epoch, dataloader_iter, tb_log=None, leave_pbar=False, scheduler=None, show_grad_curve=False,
                     logger=None, logger_iter_interval=50, cur_epoch=None, total_epochs=None, ckpt_save_dir=None, ckpt_save_time_interval=300,
                     grad_accum_nums=1):
+    """
+    训练一个 epoch
+    
+    Args:
+        grad_accum_nums: 梯度累积次数，默认为1（不累积）
+                        如果设置为4，则每4个batch才更新一次参数
+                        等效 batch_size = batch_size * grad_accum_nums
+    """
     if total_it_each_epoch == len(train_loader):
         dataloader_iter = iter(train_loader)
 
@@ -46,11 +55,12 @@ def train_one_epoch(model, optimizer, train_loader, accumulated_iter, optim_cfg,
         model.train()
         
         # 2. 删除此处的 optimizer.zero_grad()，否则无法累积梯度
-        # optimizer.zero_grad() 
-        batch['it'] = accumulated_iter 
+        # optimizer.zero_grad()
+        
+        batch['it'] = accumulated_iter
         loss, tb_dict, disp_dict = model(batch)
         
-        # 3. Loss 缩放
+        # 3. Loss 缩放：保证累积后的梯度大小与大batch一致
         loss = loss / grad_accum_nums
         loss.backward()
 
@@ -62,7 +72,7 @@ def train_one_epoch(model, optimizer, train_loader, accumulated_iter, optim_cfg,
             
             # 5. 只有在这里才更新参数
             optimizer.step()
-            optimizer.zero_grad() # 更新完必须清空，为下一轮累积做准备
+            optimizer.zero_grad()  # 更新完必须清空，为下一轮累积做准备
             
             if optimizer_2 is not None:
                 optimizer_2.step()
@@ -75,12 +85,11 @@ def train_one_epoch(model, optimizer, train_loader, accumulated_iter, optim_cfg,
                 except:
                     scheduler.step()
 
-        # 7. 计数器只加一次，且放在逻辑最后
+        # 7. 计数器加一
         accumulated_iter += 1
         
-        # --- 原始代码中错误的 step 和重复的计数已被删除 ---
-
-        disp_dict.update({'loss': loss.item() * grad_accum_nums, 'lr': cur_lr}) # 显示 loss 时乘回去，方便查看原始数值
+        # 显示 loss 时乘回去，方便查看原始数值
+        disp_dict.update({'loss': loss.item() * grad_accum_nums, 'lr': cur_lr})
 
         # log to console and tensorboard
         if rank == 0:
@@ -104,12 +113,13 @@ def train_one_epoch(model, optimizer, train_loader, accumulated_iter, optim_cfg,
                 tb_log.add_scalar('meta_data/learning_rate', cur_lr, accumulated_iter)
                 for key, val in tb_dict.items():
                     tb_log.add_scalar('train/' + key, val, accumulated_iter)
-                tb_log.add_scalar('train/total_norm', total_norm, accumulated_iter)
+                if total_norm > 0:  # 只有在更新参数时才记录 norm
+                    tb_log.add_scalar('train/total_norm', total_norm, accumulated_iter)
                 if show_grad_curve:
                     for key, val in model.named_parameters():
                         key = key.replace('.', '/')
                         try:
-                             # 只有在梯度存在时才记录，避免累积过程中某些参数无梯度报错
+                            # 只有在梯度存在时才记录，避免累积过程中某些参数无梯度报错
                             if val.grad is not None:
                                 tb_log.add_scalar('train_grad/' + key, val.grad.abs().max().item(), accumulated_iter)
                         except:
@@ -127,6 +137,7 @@ def train_one_epoch(model, optimizer, train_loader, accumulated_iter, optim_cfg,
     if rank == 0:
         pbar.close()
     return accumulated_iter
+
 
 def learning_rate_decay(i_epoch, optimizer, optim_cfg):
     if isinstance(optimizer, list):
@@ -164,7 +175,6 @@ def train_model(model, optimizer, train_loader, optim_cfg,
             if scheduler is None:
                 learning_rate_decay(cur_epoch, optimizer, optim_cfg)
 
-            # train one epoch
             accumulated_iter = train_one_epoch(
                 model, optimizer, train_loader,
                 accumulated_iter=accumulated_iter, optim_cfg=optim_cfg,

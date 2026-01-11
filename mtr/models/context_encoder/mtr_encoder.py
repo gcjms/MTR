@@ -47,6 +47,7 @@ class MTREncoder(nn.Module):
                 use_local_attn=self.use_local_attn
             ))
 
+        # 构建 Transformer 编码层 (标准的 Transformer Encoder)
         self.self_attn_layers = nn.ModuleList(self_attn_layers)
         self.num_out_channels = self.model_cfg.D_MODEL
 
@@ -147,10 +148,12 @@ class MTREncoder(nn.Module):
         """
         Args:
             batch_dict:
-              input_dict:
+              input_dict: 包含所有输入数据的字典
         """
         input_dict = batch_dict['input_dict']
+        # obj_trajs: 障碍物轨迹 (batch, num_objects, num_timestamps, 29) - 29包含位置、速度、大小等
         obj_trajs, obj_trajs_mask = input_dict['obj_trajs'].cuda(), input_dict['obj_trajs_mask'].cuda() 
+        # map_polylines: 地图车道线 (batch, num_polylines, 50, 9)
         map_polylines, map_polylines_mask = input_dict['map_polylines'].cuda(), input_dict['map_polylines_mask'].cuda() 
 
         obj_trajs_last_pos = input_dict['obj_trajs_last_pos'].cuda() 
@@ -162,35 +165,43 @@ class MTREncoder(nn.Module):
         num_center_objects, num_objects, num_timestamps, _ = obj_trajs.shape
         num_polylines = map_polylines.shape[1]
 
-        # apply polyline encoder
+        # 1. 初始特征编码 (Polyline Encoding)
+        # 将原始的点序列 (Trajectory/Lane) 编码成高维特征向量
         obj_trajs_in = torch.cat((obj_trajs, obj_trajs_mask[:, :, :, None].type_as(obj_trajs)), dim=-1)
         obj_polylines_feature = self.agent_polyline_encoder(obj_trajs_in, obj_trajs_mask)  # (num_center_objects, num_objects, C)
         map_polylines_feature = self.map_polyline_encoder(map_polylines, map_polylines_mask)  # (num_center_objects, num_polylines, C)
 
-        # apply self-attn
+        # 2. 注意力机制交互 (Self-Attention)
+        # 准备 Global Transformer 的输入
         obj_valid_mask = (obj_trajs_mask.sum(dim=-1) > 0)  # (num_center_objects, num_objects)
         map_valid_mask = (map_polylines_mask.sum(dim=-1) > 0)  # (num_center_objects, num_polylines)
 
+        # 拼接 障碍物特征 和 地图特征
         global_token_feature = torch.cat((obj_polylines_feature, map_polylines_feature), dim=1) 
         global_token_mask = torch.cat((obj_valid_mask, map_valid_mask), dim=1) 
         global_token_pos = torch.cat((obj_trajs_last_pos, map_polylines_center), dim=1) 
 
+        # 执行 Transformer 编码
         if self.use_local_attn:
+            # 局部注意力 (Local Attention): 只和附近的 token 交互，计算量更小
             global_token_feature = self.apply_local_attn(
                 x=global_token_feature, x_mask=global_token_mask, x_pos=global_token_pos,
                 num_of_neighbors=self.model_cfg.NUM_OF_ATTN_NEIGHBORS
             )
         else:
+            # 全局注意力 (Global Attention): 所有 token 两两交互
             global_token_feature = self.apply_global_attn(
                 x=global_token_feature, x_mask=global_token_mask, x_pos=global_token_pos
             )
 
+        # 拆分回 障碍物特征 和 地图特征
         obj_polylines_feature = global_token_feature[:, :num_objects]
         map_polylines_feature = global_token_feature[:, num_objects:]
         assert map_polylines_feature.shape[1] == num_polylines
 
-        # organize return features
-        # 从当前 Batch 的每一个样本中，提取出我们要预测的那辆特定车的特征, 这个track_index_to_predict在数据处理阶段就已经搞好了
+        # 提取需要预测的目标 (Agent of Interest) 的特征
+        # 从当前 Batch 的每一个样本中，提取出我们要预测的那辆特定车的特征
+        # track_index_to_predict 在数据处理阶段就已经确定好
         # center_objects_feature: (num_center_objects, C)
         center_objects_feature = obj_polylines_feature[torch.arange(num_center_objects), track_index_to_predict]
 
