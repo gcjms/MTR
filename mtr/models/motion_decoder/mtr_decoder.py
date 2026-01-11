@@ -14,6 +14,7 @@ from mtr.models.utils.transformer import transformer_decoder_layer
 from mtr.models.utils.transformer import position_encoding_utils
 from mtr.models.utils import common_layers
 from mtr.models.utils.condition_encoder import ConditionEncoder  # NEW: Conditional Encoder
+from mtr.models.utils.causal_scorer import CausalScorer, causal_planning_loss, compute_collision_cost  # NEW: Causal Scorer
 from mtr.utils import common_utils, loss_utils, motion_utils
 from mtr.config import cfg
 
@@ -97,6 +98,19 @@ class MTRDecoder(nn.Module):
             nn.Linear(self.d_model, self.d_model)
         )
         # ========== End of Conditional Encoding Module ==========
+        
+        # ========== NEW: Causal Scorer for K-world Selection ==========
+        # [Purpose] Score K parallel worlds and select the safest decision
+        # [When] Used during inference to choose which ego trajectory to execute
+        if self.model_cfg.get('USE_CAUSAL_SCORER', False):
+            self.causal_scorer = CausalScorer(
+                d_model=self.d_model,
+                num_heads=self.model_cfg.get('SCORER_NUM_HEADS', 4),
+                hidden_dim=self.model_cfg.get('SCORER_HIDDEN_DIM', 128)
+            )
+        else:
+            self.causal_scorer = None
+        # ========== End of Causal Scorer ==========
 
         self.forward_ret_dict = {}
 
@@ -659,10 +673,95 @@ class MTRDecoder(nn.Module):
             tb_dict.update(contrastive_tb_dict)
         # ========== End of contrastive loss ==========
         
+        # ========== NEW: Add causal planning loss for K-world scoring ==========
+        if self.model_cfg.get('USE_CAUSAL_PLANNING_LOSS', False) and self.causal_scorer is not None:
+            loss_causal_planning, causal_tb_dict = self.get_causal_planning_loss(tb_pre_tag=tb_pre_tag)
+            total_loss = total_loss + loss_causal_planning
+            tb_dict.update(causal_tb_dict)
+        # ========== End of causal planning loss ==========
+        
         tb_dict[f'{tb_pre_tag}loss'] = total_loss.item()
         disp_dict[f'{tb_pre_tag}loss'] = total_loss.item()
 
         return total_loss, tb_dict, disp_dict
+    
+    def get_causal_planning_loss(self, tb_pre_tag=''):
+        """
+        因果规划损失：训练 CausalScorer 打分网络
+        
+        【目的】
+        1. 模仿损失：让模型给接近 GT 的轨迹打高分
+        2. 安全损失：让模型给危险（碰撞）的轨迹打低分
+        """
+        if 'num_conditions' not in self.forward_ret_dict:
+            return torch.tensor(0.0).cuda(), {}
+        
+        K = self.forward_ret_dict['num_conditions']
+        if K <= 1:
+            return torch.tensor(0.0).cuda(), {}
+        
+        B_original = self.forward_ret_dict['num_center_objects_original']
+        pred_list = self.forward_ret_dict['pred_list']
+        
+        # 获取自车候选轨迹
+        if 'ego_future_candidates' not in self.forward_ret_dict:
+            return torch.tensor(0.0).cuda(), {}
+        
+        ego_candidates = self.forward_ret_dict['ego_future_candidates'].cuda()  # (B, K, T, 2)
+        
+        # 获取最后一层的预测
+        pred_scores, pred_trajs = pred_list[-1]  # (B*K, num_query, T, 7)
+        
+        # Reshape: (B*K, num_query, T, 7) -> (B, K, num_query, T, 7)
+        num_query = pred_trajs.shape[1]
+        T_pred = pred_trajs.shape[2]
+        pred_trajs_reshaped = pred_trajs.view(B_original, K, num_query, T_pred, -1)
+        
+        # 提取位置信息 (B, K, num_query, T, 2)
+        neighbor_pred_positions = pred_trajs_reshaped[:, :, :, :, 0:2]
+        
+        # 创建 mask (所有预测都有效)
+        neighbor_mask = torch.ones(B_original, num_query, device=pred_trajs.device).bool()
+        
+        # 使用 CausalScorer 打分
+        causal_scores = self.causal_scorer(
+            ego_trajs=ego_candidates,
+            neighbor_pred_trajs=neighbor_pred_positions,
+            neighbor_mask=neighbor_mask
+        )  # (B, K)
+        
+        # 获取自车 GT 轨迹 (如果有的话)
+        gt_trajectory = None
+        if 'center_gt_trajs' in self.forward_ret_dict:
+            center_gt_trajs = self.forward_ret_dict['center_gt_trajs'].cuda()  # (B, T, 4)
+            gt_trajectory = center_gt_trajs[:, :, 0:2]  # 只取位置 (B, T, 2)
+            # 可能需要处理时间步不匹配的问题
+            T_ego = ego_candidates.shape[2]
+            T_gt = gt_trajectory.shape[1]
+            if T_gt > T_ego:
+                gt_trajectory = gt_trajectory[:, :T_ego, :]
+            elif T_gt < T_ego:
+                # 用最后一个位置填充
+                padding = gt_trajectory[:, -1:, :].expand(-1, T_ego - T_gt, -1)
+                gt_trajectory = torch.cat([gt_trajectory, padding], dim=1)
+        
+        # 计算 causal planning loss
+        loss_causal, loss_dict = causal_planning_loss(
+            pred_scores=causal_scores,
+            ego_trajs=ego_candidates,
+            neighbor_pred_trajs=neighbor_pred_positions,
+            neighbor_mask=neighbor_mask,
+            gt_trajectory=gt_trajectory,
+            safety_threshold=self.model_cfg.get('SAFETY_THRESHOLD', 1.5),
+            imitation_weight=self.model_cfg.LOSS_WEIGHTS.get('causal_imitation', 1.0),
+            safety_weight=self.model_cfg.LOSS_WEIGHTS.get('causal_safety', 10.0)
+        )
+        
+        # 添加前缀
+        tb_dict = {f'{tb_pre_tag}{k}': v for k, v in loss_dict.items()}
+        tb_dict[f'{tb_pre_tag}loss_causal_planning'] = loss_causal.item()
+        
+        return loss_causal, tb_dict
 
     def get_contrastive_loss(self, tb_pre_tag=''):
         """
@@ -832,11 +931,92 @@ class MTRDecoder(nn.Module):
         # 5. 根据模式处理输出
         if not self.training:
             # === 推理模式 (Inference) ===
-            # 取最后一层的预测结果，进行 NMS (非极大值抑制) 去重，选出最好的几条轨迹
-            pred_scores, pred_trajs = self.generate_final_prediction(pred_list=pred_list, batch_dict=batch_dict)
-            # 将最终结果写入 batch_dict 返回
-            batch_dict['pred_scores'] = pred_scores  # (num_center_objects, num_modes)
-            batch_dict['pred_trajs'] = pred_trajs    # (num_center_objects, num_modes, num_future, 7)
+            
+            # 检查是否有条件输入 (K 个平行世界)
+            has_conditions = 'ego_future_candidates' in input_dict and input_dict['ego_future_candidates'] is not None
+            
+            if has_conditions and 'num_conditions' in self.forward_ret_dict:
+                # ========== K 个平行世界的选择逻辑 ==========
+                K = self.forward_ret_dict['num_conditions']
+                B_original = self.forward_ret_dict['num_center_objects_original']
+                ego_candidates = input_dict['ego_future_candidates'].cuda()  # (B, K, T, 2)
+                
+                # 获取最后一层的预测 (B*K, num_query, T, 7)
+                pred_scores_raw, pred_trajs_raw = pred_list[-1]
+                
+                # 首先做 NMS 得到精简的预测
+                # (B*K, num_query, ...) -> (B*K, num_modes, ...)
+                pred_scores_nms, pred_trajs_nms = self.generate_final_prediction(pred_list=pred_list, batch_dict=batch_dict)
+                
+                num_modes = pred_trajs_nms.shape[1]
+                T_pred = pred_trajs_nms.shape[2]
+                
+                # Reshape: (B*K, num_modes, T, 7) -> (B, K, num_modes, T, 7)
+                pred_trajs_reshaped = pred_trajs_nms.view(B_original, K, num_modes, T_pred, -1)
+                pred_scores_reshaped = pred_scores_nms.view(B_original, K, num_modes)
+                
+                # 提取邻居预测位置 (B, K, num_modes, T, 2)
+                neighbor_pred_positions = pred_trajs_reshaped[:, :, :, :, 0:2]
+                
+                # 计算每个平行世界的安全性
+                # 简化处理：只看最可能的轨迹 (mode 0) 的碰撞风险
+                # neighbor_pred_for_cost: (B, K, 1, T, 2) - 把 num_modes 看作 N 个"邻居"
+                neighbor_pred_for_cost = neighbor_pred_positions[:, :, :1, :, :]  # 取 mode 0
+                
+                # 创建一个简单的 mask (所有 mode 都有效)
+                neighbor_mask_simple = torch.ones(B_original, 1, device=ego_candidates.device).bool()
+                
+                # 计算碰撞代价
+                collision_cost, min_distances = compute_collision_cost(
+                    ego_trajs=ego_candidates,  # (B, K, T, 2)
+                    neighbor_pred_trajs=neighbor_pred_for_cost,  # (B, K, 1, T, 2)
+                    neighbor_mask=neighbor_mask_simple,  # (B, 1)
+                    safety_threshold=self.model_cfg.get('SAFETY_THRESHOLD', 1.5)
+                )
+                
+                # 如果有 CausalScorer，用它来打分
+                if self.causal_scorer is not None:
+                    # 聚合所有 mode 的邻居预测作为环境特征
+                    # neighbor_pred_positions: (B, K, num_modes, T, 2)
+                    causal_scores = self.causal_scorer(
+                        ego_trajs=ego_candidates,
+                        neighbor_pred_trajs=neighbor_pred_positions.transpose(2, 3).reshape(B_original, K, num_modes, T_pred, 2),
+                        neighbor_mask=torch.ones(B_original, num_modes, device=ego_candidates.device).bool()
+                    )
+                    # 结合 scorer 分数和碰撞代价
+                    # 分数越高越好，代价越低越好
+                    final_world_scores = causal_scores - collision_cost * 10.0
+                else:
+                    # 没有 scorer，直接用负碰撞代价作为分数
+                    final_world_scores = -collision_cost
+                
+                # 选择最优的 K
+                best_k_idx = final_world_scores.argmax(dim=-1)  # (B,)
+                
+                # 提取最优世界的预测
+                # (B, K, num_modes, T, 7) -> (B, num_modes, T, 7)
+                batch_indices = torch.arange(B_original, device=best_k_idx.device)
+                pred_trajs_best = pred_trajs_reshaped[batch_indices, best_k_idx]  # (B, num_modes, T, 7)
+                pred_scores_best = pred_scores_reshaped[batch_indices, best_k_idx]  # (B, num_modes)
+                
+                # 将结果写入 batch_dict
+                batch_dict['pred_scores'] = pred_scores_best
+                batch_dict['pred_trajs'] = pred_trajs_best
+                
+                # 额外输出：K 个平行世界的信息 (便于分析和可视化)
+                batch_dict['all_world_pred_trajs'] = pred_trajs_reshaped  # (B, K, num_modes, T, 7)
+                batch_dict['all_world_pred_scores'] = pred_scores_reshaped  # (B, K, num_modes)
+                batch_dict['world_selection_scores'] = final_world_scores  # (B, K)
+                batch_dict['selected_world_idx'] = best_k_idx  # (B,)
+                batch_dict['collision_costs'] = collision_cost  # (B, K)
+                batch_dict['min_distances'] = min_distances  # (B, K)
+                # ========== End of K-world selection ==========
+                
+            else:
+                # 普通推理 (没有条件输入)
+                pred_scores, pred_trajs = self.generate_final_prediction(pred_list=pred_list, batch_dict=batch_dict)
+                batch_dict['pred_scores'] = pred_scores
+                batch_dict['pred_trajs'] = pred_trajs
 
         else:
             # === 训练模式 (Training) ===
@@ -853,5 +1033,9 @@ class MTRDecoder(nn.Module):
 
             # 对象类型 (用于按类别统计 Metrics)
             self.forward_ret_dict['center_objects_type'] = input_dict['center_objects_type']
+            
+            # 保存自车候选轨迹用于 causal_planning_loss
+            if 'ego_future_candidates' in input_dict and input_dict['ego_future_candidates'] is not None:
+                self.forward_ret_dict['ego_future_candidates'] = input_dict['ego_future_candidates']
 
         return batch_dict
