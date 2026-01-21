@@ -15,6 +15,7 @@ from mtr.models.utils.transformer import position_encoding_utils
 from mtr.models.utils import common_layers
 from mtr.models.utils.condition_encoder import ConditionEncoder  # NEW: Conditional Encoder
 from mtr.models.utils.causal_scorer import CausalScorer, causal_planning_loss, compute_collision_cost  # NEW: Causal Scorer
+from mtr.utils.frenet_sampler import build_frenet_sampler  # NEW: Frenet Sampler
 from mtr.utils import common_utils, loss_utils, motion_utils
 from mtr.config import cfg
 
@@ -111,6 +112,15 @@ class MTRDecoder(nn.Module):
         else:
             self.causal_scorer = None
         # ========== End of Causal Scorer ==========
+
+        # ========== NEW: Frenet Sampler for Inference ==========
+        # [Purpose] Generate candidate trajectories if not provided by dataset
+        self.frenet_sampler = build_frenet_sampler(config={
+            'time_horizon': self.num_future_frames * 0.1,
+            'dt': 0.1,
+            'max_velocity': 30.0
+        })
+        # =======================================================
 
         self.forward_ret_dict = {}
 
@@ -902,6 +912,42 @@ class MTRDecoder(nn.Module):
             obj_feature=obj_feature, obj_mask=obj_mask, obj_pos=obj_pos
         )
         
+        
+        # ========== NEW: Automatic Candidate Generation ==========
+        # If ego_future_candidates is missing, generate it on-the-fly
+        if 'ego_future_candidates' not in input_dict or input_dict['ego_future_candidates'] is None:
+            if self.training and 'center_gt_trajs' in input_dict:
+                # [Training] Generate candidates by adding noise to GT
+                # Purpose: Train CausalScorer to identify the best trajectory among noisy ones
+                gt_trajs = input_dict['center_gt_trajs'][:, :, 0:2]  # (B, T, 2)
+                B, T, _ = gt_trajs.shape
+                K = 6  # Generate 6 candidates (1 GT + 5 Noisy)
+                
+                # Create K copies
+                candidates = gt_trajs.unsqueeze(1).repeat(1, K, 1, 1)  # (B, K, T, 2)
+                
+                # Add noise to K-1 candidates (Keep index 0 as clean GT)
+                noise_scale = 1.0  # standard deviation in meters
+                noise = torch.randn(B, K-1, T, 2, device=gt_trajs.device) * noise_scale
+                candidates[:, 1:] += noise
+                
+                input_dict['ego_future_candidates'] = candidates
+                
+            elif not self.training:
+                # [Inference] Generate candidates using FrenetSampler
+                # Purpose: Provide diverse planning options for the model to evaluate
+                # Note: Assuming default velocity 10 m/s if not available. 
+                # TODO: Extract real velocity from obj_feature if possible.
+                
+                current_vel = torch.full((num_center_objects,), 10.0, device=obj_feature.device)
+                candidates = self.frenet_sampler.sample_torch(
+                    current_velocity=current_vel,
+                    device=obj_feature.device
+                ) # (B, K, T, 2)
+                
+                input_dict['ego_future_candidates'] = candidates
+        # ========================================================
+
         # ========== NEW: Conditional Encoding (条件编码) ==========
         # [目的] 将自车候选轨迹编码为条件向量
         # [输入] ego_future_candidates: (num_center_objects, K, T, 2) 或 None

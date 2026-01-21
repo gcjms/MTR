@@ -74,10 +74,27 @@ MODEL:
         LOSS_WEIGHTS: {
             'cls': 1.0, 
             'reg': 1.0, 
-            'vel': 0.5
+            'vel': 0.5,
+            'causal_imitation': 1.0,
+            'causal_safety': 10.0,
+            'contrastive': 0.1
         }
 
         NMS_DIST_THRESH: 2.5
+
+        # ========== Causal MTR 配置 ==========
+        # 因果打分网络 (CausalScorer)
+        USE_CAUSAL_SCORER: True
+        SCORER_NUM_HEADS: 4
+        SCORER_HIDDEN_DIM: 128
+        
+        # 因果规划损失
+        USE_CAUSAL_PLANNING_LOSS: True
+        SAFETY_THRESHOLD: 1.5
+        
+        # 对比损失 (鼓励不同条件产生不同预测)
+        USE_CONTRASTIVE_LOSS: True
+        CONTRASTIVE_MARGIN: 2.0
 
 
 OPTIMIZATION:
