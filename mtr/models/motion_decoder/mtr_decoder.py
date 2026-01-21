@@ -585,6 +585,22 @@ class MTRDecoder(nn.Module):
                 raise NotImplementedError
 
             pred_scores, pred_trajs = pred_list[layer_idx]
+            
+            # ========== NEW: Handle Batch Expansion (B*K) form Conditional Prediction ==========
+            if 'num_conditions' in self.forward_ret_dict and self.forward_ret_dict['num_conditions'] > 1:
+                K = self.forward_ret_dict['num_conditions']
+                B_orig = self.forward_ret_dict['num_center_objects_original']
+                
+                # Reshape: (B*K, num_query, ...) -> (B, K, num_query, ...)
+                pred_scores = pred_scores.view(B_orig, K, pred_scores.shape[1])
+                pred_trajs = pred_trajs.view(B_orig, K, pred_trajs.shape[1], pred_trajs.shape[2], pred_trajs.shape[3])
+                
+                # Select the 0-th condition (Condition 0 is the Clean GT during training)
+                # We only supervise the clean condition with standard MTR loss
+                pred_scores = pred_scores[:, 0, :]
+                pred_trajs = pred_trajs[:, 0, :, :, :]
+            # ===================================================================================
+
             assert pred_trajs.shape[-1] == 7
             pred_trajs_gmm, pred_vel = pred_trajs[:, :, :, 0:5], pred_trajs[:, :, :, 5:7]
 
