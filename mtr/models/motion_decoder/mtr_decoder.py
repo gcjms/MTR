@@ -516,46 +516,39 @@ class MTRDecoder(nn.Module):
             geometry_attention_bias = None
             if self.geometry_attention_mask is not None and 'pred_dense_trajs' in self.forward_ret_dict:
                 try:
+                    # Get current device
+                    device = pred_waypoints.device
+                    
                     # Get obstacle trajectories from Dense Future Prediction
                     # pred_dense_trajs: (B_orig, N, T, 7) -> (B_orig, N, T, 2) only position
-                    dense_trajs = self.forward_ret_dict['pred_dense_trajs'][:, :, :, 0:2]
-                    T_obstacle = dense_trajs.shape[2]  # Number of time steps
+                    dense_trajs = self.forward_ret_dict['pred_dense_trajs'][:, :, :, 0:2].to(device)
+                    B_dense, N_obstacles, T_obstacle, _ = dense_trajs.shape
                     
                     # Get ego candidate trajectories
-                    # Priority: ego_future_candidates > pred_waypoints
-                    if 'ego_future_candidates' in self.forward_ret_dict:
-                        # ego_future_candidates: (B_orig, K, T, 2)
-                        ego_trajs = self.forward_ret_dict['ego_future_candidates']
-                    else:
-                        # Fallback: use pred_waypoints (from previous layer prediction)
-                        # pred_waypoints: (B*K, num_query, T_pred, 2)
-                        # Note: T_pred may be 1 (first layer) or num_future_frames (later layers)
-                        T_pred = pred_waypoints.shape[2]
-                        
-                        if T_pred < T_obstacle:
-                            # First layer: pred_waypoints only has 1 time step (intention_points)
-                            # Expand by repeating to match T_obstacle
-                            ego_trajs = pred_waypoints.repeat(1, 1, T_obstacle, 1)
+                    # Current batch size (may be B*K if conditional prediction)
+                    B_current = num_center_objects  # After expansion if applicable
+                    
+                    # Use pred_waypoints as ego trajectory source
+                    # pred_waypoints: (B_current, num_query, T_pred, 2)
+                    T_pred = pred_waypoints.shape[2]
+                    ego_trajs = pred_waypoints.to(device)  # (B_current, num_query, T_pred, 2)
+                    
+                    # Align time dimension: use minimum of T_pred and T_obstacle
+                    T_common = min(T_pred, T_obstacle)
+                    ego_trajs = ego_trajs[:, :, :T_common, :]  # (B_current, num_query, T_common, 2)
+                    dense_trajs = dense_trajs[:, :, :T_common, :]  # (B_dense, N, T_common, 2)
+                    
+                    # Handle batch dimension mismatch
+                    # dense_trajs is (B_orig, N, T, 2), ego_trajs is (B_current, Q, T, 2)
+                    # When conditional prediction: B_current = B_orig * K
+                    if B_dense != B_current:
+                        if B_current > B_dense and B_current % B_dense == 0:
+                            # Expand dense_trajs: (B_orig, N, T, 2) -> (B_orig*K, N, T, 2)
+                            expand_factor = B_current // B_dense
+                            dense_trajs = dense_trajs.repeat_interleave(expand_factor, dim=0)
                         else:
-                            ego_trajs = pred_waypoints
-                    
-                    # Handle batch expansion for conditional prediction
-                    # When condition_vector is provided, batch is expanded: B -> B*K
-                    if num_conditions > 1:
-                        B_orig = self.forward_ret_dict['num_center_objects_original']
-                        # dense_trajs is (B_orig, N, T, 2), need to expand to (B_orig*K, N, T, 2)
-                        dense_trajs = dense_trajs.repeat_interleave(num_conditions, dim=0)
-                        # ego_trajs:
-                        # - If from ego_future_candidates: (B_orig, K, T, 2) -> reshape for each condition
-                        # - If from pred_waypoints: already (B*K, num_query, T, 2)
-                        if 'ego_future_candidates' in self.forward_ret_dict:
-                            # Reshape: (B_orig, K, T, 2) -> (B_orig*K, 1, T, 2) -> broadcast
-                            ego_trajs = ego_trajs.view(B_orig * num_conditions, 1, -1, 2)
-                            # Repeat to match num_query
-                            ego_trajs = ego_trajs.repeat(1, num_query, 1, 1)  # (B*K, num_query, T, 2)
-                    
-                    # Ensure obj_mask matches expanded batch
-                    current_obj_mask = obj_mask  # Already expanded in condition block
+                            # Cannot align, skip GGAM
+                            raise ValueError(f"Batch size mismatch: dense={B_dense}, current={B_current}")
                     
                     # Compute geometry attention bias
                     # ego_trajs: (B, num_query, T, 2), dense_trajs: (B, N, T, 2)
@@ -563,12 +556,12 @@ class MTRDecoder(nn.Module):
                     geometry_attention_bias = self.geometry_attention_mask(
                         ego_trajs=ego_trajs,
                         obstacle_trajs=dense_trajs,
-                        obstacle_mask=current_obj_mask
+                        obstacle_mask=obj_mask
                     )
                 except Exception as e:
                     # Graceful fallback: if GGAM fails, continue without it
                     geometry_attention_bias = None
-                    if layer_idx == 0:  # Only warn once
+                    if layer_idx == 0:  # Only warn once per forward pass
                         print(f"[GGAM Warning] Geometry mask computation failed: {e}")
             # ========== End of GGAM ==========
             
