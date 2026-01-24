@@ -288,14 +288,18 @@ class MTRDecoder(nn.Module):
 
         # ========== NEW: Prepare memory_mask with geometry attention bias ==========
         # Transform geometry_attention_bias to the format expected by MultiheadAttention
-        # geometry_attention_bias: (B, M, N) -> memory_mask: (B*num_heads, M, N) for additive mask
+        # geometry_attention_bias: (B, num_q, N) -> memory_mask: (B*num_heads, num_q, N) for additive mask
         # Note: memory_mask in PyTorch attention is ADDITIVE (added to attention logits before softmax)
         attn_mask = None
         if geometry_attention_bias is not None and not use_local_attn:
-            # geometry_attention_bias: (B, num_q, num_kv) or (B, 1, num_kv)
-            # Expand to match attention heads if needed
-            # For now, we reshape to (B, M, N) -> (M, B, N) to match query-first format
-            attn_mask = geometry_attention_bias.permute(1, 0, 2)  # (M, B, N)
+            # geometry_attention_bias: (B, num_q, num_kv)
+            # PyTorch MultiheadAttention expects: (B*num_heads, num_q, num_kv)
+            B, M, N = geometry_attention_bias.shape
+            num_heads = self.model_cfg.NUM_ATTN_HEAD  # Get number of attention heads
+            # Expand: (B, num_q, N) -> (B, num_heads, num_q, N) -> (B*num_heads, num_q, N)
+            attn_mask = geometry_attention_bias.unsqueeze(1)  # (B, 1, num_q, N)
+            attn_mask = attn_mask.expand(-1, num_heads, -1, -1)  # (B, num_heads, num_q, N)
+            attn_mask = attn_mask.reshape(B * num_heads, M, N)  # (B*num_heads, num_q, N)
         # ========== End of geometry attention bias handling ==========
 
         if not use_local_attn:
