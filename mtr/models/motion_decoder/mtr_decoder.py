@@ -15,6 +15,7 @@ from mtr.models.utils.transformer import position_encoding_utils
 from mtr.models.utils import common_layers
 from mtr.models.utils.condition_encoder import ConditionEncoder  # NEW: Conditional Encoder
 from mtr.models.utils.causal_scorer import CausalScorer, causal_planning_loss, compute_collision_cost  # NEW: Causal Scorer
+from mtr.models.utils.geometry_attention_mask import GeometryGuidedAttentionMask  # NEW: GGAM
 from mtr.utils.frenet_sampler import build_frenet_sampler  # NEW: Frenet Sampler
 from mtr.utils import common_utils, loss_utils, motion_utils
 from mtr.config import cfg
@@ -121,6 +122,21 @@ class MTRDecoder(nn.Module):
             'max_velocity': 30.0
         })
         # =======================================================
+
+        # ========== NEW: Geometry-Guided Attention Mask (GGAM) ==========
+        # [Purpose] Inject physical collision risk as attention bias
+        # [How] Compute spatio-temporal distance field, generate geometry mask, add to attention logits
+        # [Why] Solve "attention dilution" problem, add "physical safety lock" to deep learning
+        if self.model_cfg.get('USE_GEOMETRY_ATTENTION_MASK', False):
+            self.geometry_attention_mask = GeometryGuidedAttentionMask(
+                safety_threshold=self.model_cfg.get('GGAM_SAFETY_THRESHOLD', 2.0),
+                attention_boost=self.model_cfg.get('GGAM_ATTENTION_BOOST', 5.0),
+                use_soft_mask=self.model_cfg.get('GGAM_USE_SOFT_MASK', False),
+                soft_sigma=self.model_cfg.get('GGAM_SOFT_SIGMA', 1.0)
+            )
+        else:
+            self.geometry_attention_mask = None
+        # ========== End of GGAM ==========
 
         self.forward_ret_dict = {}
 
@@ -238,7 +254,8 @@ class MTRDecoder(nn.Module):
 
     def apply_cross_attention(self, kv_feature, kv_mask, kv_pos, query_content, query_embed, attention_layer,
                               dynamic_query_center=None, layer_idx=0, use_local_attn=False, query_index_pair=None,
-                              query_content_pre_mlp=None, query_embed_pre_mlp=None):
+                              query_content_pre_mlp=None, query_embed_pre_mlp=None,
+                              geometry_attention_bias=None):
         """
         Args:
             kv_feature (B, N, C):
@@ -250,6 +267,10 @@ class MTRDecoder(nn.Module):
             attention_layer (layer):
 
             query_index_pair (B, M, K)
+            
+            geometry_attention_bias (B, M, N): [NEW] GGAM 几何注意力偏置
+                正值表示需要增强关注（有碰撞风险的障碍物）
+                在 Softmax 之前叠加到 attention logits 上
 
         Returns:
             attended_features: (B, M, C)
@@ -265,6 +286,18 @@ class MTRDecoder(nn.Module):
         kv_pos = kv_pos.permute(1, 0, 2)[:, :, 0:2]
         kv_pos_embed = position_encoding_utils.gen_sineembed_for_position(kv_pos, hidden_dim=d_model)
 
+        # ========== NEW: Prepare memory_mask with geometry attention bias ==========
+        # Transform geometry_attention_bias to the format expected by MultiheadAttention
+        # geometry_attention_bias: (B, M, N) -> memory_mask: (B*num_heads, M, N) for additive mask
+        # Note: memory_mask in PyTorch attention is ADDITIVE (added to attention logits before softmax)
+        attn_mask = None
+        if geometry_attention_bias is not None and not use_local_attn:
+            # geometry_attention_bias: (B, num_q, num_kv) or (B, 1, num_kv)
+            # Expand to match attention heads if needed
+            # For now, we reshape to (B, M, N) -> (M, B, N) to match query-first format
+            attn_mask = geometry_attention_bias.permute(1, 0, 2)  # (M, B, N)
+        # ========== End of geometry attention bias handling ==========
+
         if not use_local_attn:
             query_feature = attention_layer(
                 tgt=query_content,
@@ -272,6 +305,7 @@ class MTRDecoder(nn.Module):
                 query_sine_embed=searching_query,
                 memory=kv_feature.permute(1, 0, 2),
                 memory_key_padding_mask=~kv_mask,
+                memory_mask=attn_mask,  # [NEW] Pass geometry attention bias as memory_mask
                 pos=kv_pos_embed,
                 is_first=(layer_idx == 0)
             )  # (M, B, C)
@@ -469,12 +503,78 @@ class MTRDecoder(nn.Module):
             #                       这里传入的是当前这一层锚点在地图上的绝对坐标，用于和 kv_pos 计算相对距离。
             #                       形状: (num_query, Batch, 2)
             #
+            
+            # ========== NEW: Geometry-Guided Attention Masking (GGAM) ==========
+            # [Purpose] Inject physical collision risk as attention bias
+            # [How] Use Dense Future Prediction as obstacle trajectories,
+            #       compute spatio-temporal distance with ego candidates,
+            #       generate geometry mask for attention logits
+            geometry_attention_bias = None
+            if self.geometry_attention_mask is not None and 'pred_dense_trajs' in self.forward_ret_dict:
+                try:
+                    # Get obstacle trajectories from Dense Future Prediction
+                    # pred_dense_trajs: (B_orig, N, T, 7) -> (B_orig, N, T, 2) only position
+                    dense_trajs = self.forward_ret_dict['pred_dense_trajs'][:, :, :, 0:2]
+                    T_obstacle = dense_trajs.shape[2]  # Number of time steps
+                    
+                    # Get ego candidate trajectories
+                    # Priority: ego_future_candidates > pred_waypoints
+                    if 'ego_future_candidates' in self.forward_ret_dict:
+                        # ego_future_candidates: (B_orig, K, T, 2)
+                        ego_trajs = self.forward_ret_dict['ego_future_candidates']
+                    else:
+                        # Fallback: use pred_waypoints (from previous layer prediction)
+                        # pred_waypoints: (B*K, num_query, T_pred, 2)
+                        # Note: T_pred may be 1 (first layer) or num_future_frames (later layers)
+                        T_pred = pred_waypoints.shape[2]
+                        
+                        if T_pred < T_obstacle:
+                            # First layer: pred_waypoints only has 1 time step (intention_points)
+                            # Expand by repeating to match T_obstacle
+                            ego_trajs = pred_waypoints.repeat(1, 1, T_obstacle, 1)
+                        else:
+                            ego_trajs = pred_waypoints
+                    
+                    # Handle batch expansion for conditional prediction
+                    # When condition_vector is provided, batch is expanded: B -> B*K
+                    if num_conditions > 1:
+                        B_orig = self.forward_ret_dict['num_center_objects_original']
+                        # dense_trajs is (B_orig, N, T, 2), need to expand to (B_orig*K, N, T, 2)
+                        dense_trajs = dense_trajs.repeat_interleave(num_conditions, dim=0)
+                        # ego_trajs:
+                        # - If from ego_future_candidates: (B_orig, K, T, 2) -> reshape for each condition
+                        # - If from pred_waypoints: already (B*K, num_query, T, 2)
+                        if 'ego_future_candidates' in self.forward_ret_dict:
+                            # Reshape: (B_orig, K, T, 2) -> (B_orig*K, 1, T, 2) -> broadcast
+                            ego_trajs = ego_trajs.view(B_orig * num_conditions, 1, -1, 2)
+                            # Repeat to match num_query
+                            ego_trajs = ego_trajs.repeat(1, num_query, 1, 1)  # (B*K, num_query, T, 2)
+                    
+                    # Ensure obj_mask matches expanded batch
+                    current_obj_mask = obj_mask  # Already expanded in condition block
+                    
+                    # Compute geometry attention bias
+                    # ego_trajs: (B, num_query, T, 2), dense_trajs: (B, N, T, 2)
+                    # Output: (B, num_query, N) - bias for each (query, obstacle) pair
+                    geometry_attention_bias = self.geometry_attention_mask(
+                        ego_trajs=ego_trajs,
+                        obstacle_trajs=dense_trajs,
+                        obstacle_mask=current_obj_mask
+                    )
+                except Exception as e:
+                    # Graceful fallback: if GGAM fails, continue without it
+                    geometry_attention_bias = None
+                    if layer_idx == 0:  # Only warn once
+                        print(f"[GGAM Warning] Geometry mask computation failed: {e}")
+            # ========== End of GGAM ==========
+            
             obj_query_feature = self.apply_cross_attention(
                 kv_feature=obj_feature, kv_mask=obj_mask, kv_pos=obj_pos,
                 query_content=query_content, query_embed=intention_query,
                 attention_layer=self.obj_decoder_layers[layer_idx],
                 dynamic_query_center=dynamic_query_center,
-                layer_idx=layer_idx
+                layer_idx=layer_idx,
+                geometry_attention_bias=geometry_attention_bias  # [NEW] Pass GGAM bias
             )
             # 输出 obj_query_feature: 
             # 经过这一次"吸星大法"后，这 64 个 Query 吸收了环境特征，变得更强了。

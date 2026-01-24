@@ -95,6 +95,14 @@ MODEL:
         # 对比损失 (鼓励不同条件产生不同预测)
         USE_CONTRASTIVE_LOSS: True
         CONTRASTIVE_MARGIN: 2.0
+        
+        # ========== GGAM 几何引导注意力掩码 ==========
+        # [Purpose] 将物理碰撞风险注入注意力机制
+        USE_GEOMETRY_ATTENTION_MASK: True
+        GGAM_SAFETY_THRESHOLD: 2.0      # 安全距离阈值 τ (米)
+        GGAM_ATTENTION_BOOST: 5.0       # 注意力增强系数 λ
+        GGAM_USE_SOFT_MASK: False       # 是否使用软掩码
+        GGAM_SOFT_SIGMA: 1.0            # 软掩码高斯标准差
 
 
 OPTIMIZATION:
